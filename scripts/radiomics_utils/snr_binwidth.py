@@ -108,7 +108,7 @@ def extract_snr_matrix_single_folder(folder_path, sequences, normalize_scale=NOR
 
 # --- EXECUTION ---
 # Path to the folder containing your calibration patient subfolders
-FOLDER_PATH = "/Volumes/T7 Shield/Restrepo/Calibration_Set"
+FOLDER_PATH = '/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Total_segmentations/liver_segs'
 SEQS = ['adc', 't2', 'hbp', 'ap', 'pre', 'pvp', 'tp', 'dwi_b1', 'dwi_b2']
 
 if __name__ == '__main__':

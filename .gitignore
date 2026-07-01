@@ -3,7 +3,11 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Sweep logs and incremental result files
+# Result and data files — keep on T7 Shield, not in repo
 scripts/radiomics_utils/sweep_logs/
 scripts/radiomics_utils/sweep_results.csv
 scripts/radiomics_utils/gridsearch_train_results.csv
+scripts/radiomics_utils/consensus_features.csv
+*.csv
+*.xlsx
+*.nrrd

@@ -75,6 +75,7 @@ extraction_settings:
   # The ideal number of bins is somewhere in the order of 16-128 bins. A possible way to define a good binwidt is to
   # extract firstorder:Range from the dataset to analyze, and choose a binwidth so, that range/binwidth remains approximately
   # in this range of bins.
+  # When execution.bin_widths is ['perseq'], this value is ignored and per_sequence_bin_widths is used instead.
   binWidth: 5
 
   # first order specific settings:
@@ -88,14 +89,42 @@ extraction_settings:
   label: 1
 
 execution:
-  readers: ['SA2']
   interpolators: ['sitkBSpline']
   spacings: [[1, 1, 1]]
-  bin_widths: [5]
+  # Use 'perseq' to activate per-sequence bin widths below; use [5] (or any int list) for a uniform sweep.
+  bin_widths: ['perseq']
+  per_sequence_bin_widths:
+    # 2 x median noise sigma (PyRadiomics-normalized space, normalizeScale=100), rounded to nearest 5.
+    # Derived from snr_binwidth.py run on liver patches in Total_segmentations/liver_segs (n=10).
+    pre:    25
+    ap:     25
+    pvp:    25
+    tp:     25
+    hbp:    40
+    t2:     15
+    dwi_b1: 40
+    dwi_b2: 40
+    adc:    60
   sequences: ['pre', 'ap', 'pvp', 'tp', 'hbp', 't2', 'dwi_b1', 'dwi_b2', 'adc']
-  
-  #readers = ['Reader1', 'Reader2']
-  #interpolators = ['sitkBSpline', 'sitkLinear']
-  #spacings = [[1, 1, 1], [1.5, 1.5, 1.5], [2, 2, 2]]
-  #bin_widths = [5, 15, 20]
-  #sequences = ['pre', 'ap', 'pvp', 'tp', 'hbp', 't2', 'dwi_b1', 'dwi_b2', 'adc']
+  # Sequences listed here use the raw (non-N4) file: {pid}_{seq}.nrrd
+  # All others use the N4-corrected file: {pid}_{seq}_N4.nrrd
+  sequences_without_n4: ['adc', 'dwi_b1', 'dwi_b2']
+
+  # Sweep options (uncomment to override):
+  #interpolators: ['sitkBSpline', 'sitkLinear']
+  #spacings: [[1, 1, 1], [1.5, 1.5, 1.5]]
+  #bin_widths: [5, 15, 20]  # restore for a uniform bin-width sweep
+
+# Each target runs independently; readers and paths are per-target.
+# Results land in: results_base_dir/reader/R-{reader}_I-{interp}_S-{spacing}mm_W-{bw}.csv
+extraction_targets:
+  - label: "main"
+    base_dir: "/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Total_segmentations"
+    results_base_dir: "/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets"
+    readers: ['SA1', 'SA2']
+  - label: "inter-reader"
+    base_dir: "/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Total_segmentations/Inter-reader"
+    # images_dir: shared images used by all readers; masks come from base_dir/reader/pid/
+    images_dir: "/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Total_segmentations/Inter-reader/images"
+    results_base_dir: "/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/inter-reader"
+    readers: ['Reader1', 'Reader2']
