@@ -41,7 +41,7 @@ from pingouin import intraclass_corr
 from sklearn.svm import SVC
 from sklearn.impute import KNNImputer
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from sklearn.preprocessing import StandardScaler
@@ -66,7 +66,7 @@ ALL_MODELS = ['logistic', 'svm_linear', 'svm_rbf', 'rf', 'extratrees', 'xgboost'
 
 # Stage to run when launching this script without a --stage flag (e.g. clicking "Run" in an IDE).
 # Still overridable from the terminal with `--stage <name>`.
-DEFAULT_STAGE = 'train'  # one of: 'partition', 'gridsearch', 'train'
+DEFAULT_STAGE = 'gridsearch'  # one of: 'partition', 'gridsearch', 'train'
 
 
 # =====================================================================================================
@@ -212,8 +212,12 @@ def compare_dev_test(df_dev, df_lock, variables, output_dir, outcome_col):
 # drop near-zero variance features. We do this to avoid data leakage, then apply the same
 # transformations to the lock set later.
 # df: development set X_dev from "partition_with_constraints"
-# var_threshold: threshold for near-zero variance filtering (e.g., 0.05)
-def global_cleanup(df, var_threshold, id_col='PatientID'):
+# cv_threshold: minimum coefficient of variation (std / |mean|) to keep a feature. CV is
+#   scale-invariant, unlike a raw std cutoff, which is what we want across thousands of radiomics
+#   features that live on wildly different scales (e.g. a firstorder_Energy in the millions next to
+#   a glcm_Correlation in [-1, 1]) -- a fixed std threshold would systematically favor keeping
+#   large-scale features and dropping small-scale ones regardless of their actual informativeness.
+def global_cleanup(df, cv_threshold, id_col='PatientID'):
     if id_col in df.columns:
         df = df.set_index(id_col)
     df = df.select_dtypes(include=[np.number])
@@ -227,7 +231,15 @@ def global_cleanup(df, var_threshold, id_col='PatientID'):
     thresh = len(df) * 0.9
     df = df.dropna(axis=1, thresh=thresh)
 
-    df = df.loc[:, df.std() > var_threshold]
+    std = df.std()
+    mean_abs = df.mean().abs()
+    # CV is undefined (or explodes) for naturally zero-centered features like glcm_ClusterShade or
+    # firstorder_Skewness, where a near-zero mean isn't a sign of low variance. For those, fall back
+    # to a tiny absolute floor that only catches genuinely-constant columns; the CV check otherwise
+    # already requires std > 0, so a feature can't sneak through here by both being flat AND centered.
+    cv = std / mean_abs.replace(0, np.nan)
+    keep = (std > 1e-8) & ((cv > cv_threshold) | cv.isna())
+    df = df.loc[:, keep]
 
     print(f"Cleanup finished. Columns remaining: {df.shape[1]}")
     return df
@@ -270,8 +282,24 @@ def interobserver_stability(df, path_r1, path_r2, threshold, id_col='PatientID')
 # KNN imputation, z-scaling, univariate filtering, correlation filtering, and LASSO-based selection.
 # Parameters (imputer, scaler, selector) are learned from the training fold only.
 
-# Calculates univariate metrics for each feature (AUC, Mann-Whitney U p-value, odds ratio).
-# X should be the training fold feature matrix.
+# Benjamini-Hochberg FDR correction. With thousands of features tested simultaneously, an
+# uncorrected p < 0.05 cutoff lets through hundreds of features by chance alone (~5% of however many
+# are tested); q-values control the expected false discovery rate among the features actually kept.
+def benjamini_hochberg(pvals):
+    pvals = np.asarray(pvals, dtype=float)
+    n = len(pvals)
+    order = np.argsort(pvals)
+    ranked = pvals[order]
+    q = ranked * n / np.arange(1, n + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0, 1)
+    out = np.empty(n)
+    out[order] = q
+    return out
+
+
+# Calculates univariate metrics for each feature (AUC, Mann-Whitney U p-value + FDR-adjusted q-value,
+# odds ratio). X should be the training fold feature matrix.
 def calculate_feature_metrics(X, y):
     metrics = []
     for col in X.columns:
@@ -296,7 +324,9 @@ def calculate_feature_metrics(X, y):
             'Odds_Ratio': odds_ratio
         })
 
-    return pd.DataFrame(metrics).set_index('Feature')
+    metrics_df = pd.DataFrame(metrics).set_index('Feature')
+    metrics_df['p_value_fdr'] = benjamini_hochberg(metrics_df['p_value'])
+    return metrics_df
 
 
 # Considers the spearman correlation between features and drops one of each correlated pair.
@@ -345,12 +375,31 @@ def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cu
     else:
         raise ValueError(f"Unknown univariate metric '{metric}'. Expected 'auc' or 'or'.")
 
-    mask_sig = scorecard['p_value'] < p_value_cutoff
-    # Final decision: Magnitude OR Significance (less strict)
-    final_mask = mask_kept | mask_sig
-    kept_features_info = scorecard[final_mask]
+    # FDR is computed only WITHIN the effect-size-screened pool, not across all total_features.
+    # Applying Benjamini-Hochberg across the full multi-thousand-feature universe is needlessly
+    # punishing here: most of those features are near-duplicates of each other (the same base
+    # feature run through dozens of wavelet/log-sigma filters) and obviously flat, so correcting
+    # against all of them buries any real signal under the correction factor (q for the single best
+    # feature would need raw p ~ p_value_cutoff/total_features, an unreasonable bar). Screening on
+    # effect size first and correcting only among the survivors is standard "independent filtering"
+    # practice (cf. DESeq2 in RNA-seq) -- it keeps the FDR budget where it's actually useful instead
+    # of diluting it across thousands of features nobody expected to be significant anyway.
+    screened = scorecard[mask_kept].copy()
+    screened['p_value_fdr_screened'] = benjamini_hochberg(screened['p_value'])
+    mask_sig = screened['p_value_fdr_screened'] < p_value_cutoff
+    kept_features_info = screened[mask_sig]
 
+    print(f"Effect-size screen ({metric}): {len(screened)} of {total_features} pass.")
+    print(f"FDR within screened pool: {mask_sig.sum()} of {len(screened)} pass q<{p_value_cutoff}.")
     print(f"Discarding {total_features - len(kept_features_info)} features.")
+
+    if len(kept_features_info) == 0:
+        raise RuntimeError(
+            f"No features survived the univariate filter for this fold (0 of {total_features}). "
+            f"{len(screened)} passed the effect-size filter, but none of those passed FDR "
+            f"q<{p_value_cutoff} within the screened pool. Loosen --p-value-cutoff (FDR q threshold) "
+            f"and/or --metric-cutoff and re-run."
+        )
 
     X_filtered = X_scaled[kept_features_info.index]
 
@@ -361,7 +410,17 @@ def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cu
     final_n = X_spearman.shape[1]
     print(f"Spearman: Dropped {initial_n - final_n} features (from {initial_n} to {final_n})")
 
-    lasso_cv = LogisticRegression(penalty='l1', solver='liblinear', C=1, random_state=random_state)
+    # C is cross-validated (inner CV, AUC-scored) rather than fixed, since an arbitrary, untuned
+    # regularization strength is what let LASSO pick a near-random support set of features each outer
+    # fold -- the single biggest driver of the fold-to-fold sign/selection instability we were seeing.
+    # class_weight='balanced' added to match every other model in this file; it was previously the
+    # only estimator here fit unweighted despite the outcome imbalance.
+    inner_splits = min(5, y_tr.value_counts().min())
+    inner_cv = StratifiedKFold(n_splits=inner_splits, shuffle=True, random_state=random_state)
+    lasso_cv = LogisticRegressionCV(
+        Cs=np.logspace(-3, 1, 15), penalty='l1', solver='liblinear', cv=inner_cv,
+        scoring='roc_auc', class_weight='balanced', max_iter=1000, random_state=random_state,
+    )
     lasso_cv.fit(X_spearman, y_tr)
 
     coefs = pd.Series(lasso_cv.coef_[0], index=X_spearman.columns)
@@ -423,8 +482,21 @@ def run_cross_validation(X, y_dev, target_count, p_value_cutoff, metric, metric_
             model = tune_model(X_tr_final, y_tr, model_name, cv=tuning_cv, random_state=random_state)
             oof_predictions.loc[X_val.index, model_name] = model.predict_proba(X_val_final)[:, 1]
 
-    fold_coefficients['Selection_Frequency'] = (fold_coefficients[[f'Fold_{i+1}' for i in range(5)]] != 0).sum(axis=1)
-    fold_coefficients['Mean_Absolute_Coefficient'] = fold_coefficients[[f'Fold_{i+1}' for i in range(5)]].abs().mean(axis=1)
+    fold_cols = [f'Fold_{i+1}' for i in range(5)]
+    fold_coefficients['Selection_Frequency'] = (fold_coefficients[fold_cols] != 0).sum(axis=1)
+    fold_coefficients['Mean_Absolute_Coefficient'] = fold_coefficients[fold_cols].abs().mean(axis=1)
+
+    # A feature whose LASSO coefficient flips sign across folds isn't a stable effect -- it's noise
+    # that happened to correlate with the outcome in one direction in some folds and the other
+    # direction in others. Only require agreement among the folds where it was actually selected
+    # (zero entries are "not selected that fold", not "selected with coefficient 0").
+    def _sign_stable(row):
+        nonzero = row[fold_cols][row[fold_cols] != 0]
+        if len(nonzero) == 0:
+            return False
+        return bool((nonzero > 0).all() or (nonzero < 0).all())
+    fold_coefficients['Sign_Stable'] = fold_coefficients.apply(_sign_stable, axis=1)
+
     fold_coefficients = fold_coefficients[fold_coefficients['Selection_Frequency'] > 0]
     fold_coefficients = fold_coefficients.sort_values(by=['Selection_Frequency', 'Mean_Absolute_Coefficient'], ascending=False)
 
@@ -1130,7 +1202,7 @@ def run_partition_stage(args):
     compare_dev_test(df_clinical_dev, df_clinical_lock, args.compare_variables,
                       output_dir=args.output_dir, outcome_col=args.compare_outcome_col)
 
-    X_dev_clean = global_cleanup(X_dev, id_col='PatientID', var_threshold=args.var_threshold)
+    X_dev_clean = global_cleanup(X_dev, id_col='PatientID', cv_threshold=args.cv_threshold)
     X_dev_clean_icc = interobserver_stability(X_dev_clean, args.path_r1, args.path_r2,
                                                id_col='PatientID', threshold=args.icc_threshold)
 
@@ -1158,7 +1230,9 @@ def run_partition_stage(args):
     print(nested_cv_summary.to_string(index=False))
     print(f"{'='*100}\n")
 
-    frequent_features = fold_coefficients[fold_coefficients['Selection_Frequency'] >= args.min_fold_n]
+    frequent_features = fold_coefficients[
+        (fold_coefficients['Selection_Frequency'] >= args.min_fold_n) & fold_coefficients['Sign_Stable']
+    ]
     consensus_features = frequent_features.head(args.target_feature_count).index.tolist()
     print(f"Consensus features identified: {len(consensus_features)}")
     print(consensus_features)
@@ -1250,10 +1324,17 @@ def parse_arguments():
     parser.add_argument('--label-col', type=str, default='TILs_resection')
     parser.add_argument('--cutoff', type=float, default=3)
     parser.add_argument('--test-size', type=int, default=30)
-    parser.add_argument('--var-threshold', type=float, default=0.05)
+    parser.add_argument('--cv-threshold', type=float, default=0.1,
+        help="Minimum coefficient of variation (std / |mean|) to keep a feature in global_cleanup. "
+             "Scale-invariant replacement for the old raw-std threshold.")
     parser.add_argument('--icc-threshold', type=float, default=0.85)
     parser.add_argument('--lasso-target-count', type=int, default=100)
-    parser.add_argument('--p-value-cutoff', type=float, default=0.05)
+    parser.add_argument('--p-value-cutoff', type=float, default=0.2,
+        help="FDR-adjusted (Benjamini-Hochberg) q-value threshold, applied AFTER the effect-size "
+             "(--metric-cutoff) screen and computed only within that screened subset -- not across "
+             "all candidate features -- so correction isn't diluted by thousands of features nobody "
+             "expected to be significant. Still a q-value, not a raw p-value (0.2 is a common "
+             "screening-stage choice).")
     parser.add_argument('--univariate-metric', type=str, default='auc')
     parser.add_argument('--metric-cutoff', type=float, default=0.65)
     parser.add_argument('--min-fold-n', type=int, default=3)
@@ -1265,17 +1346,18 @@ def parse_arguments():
     parser.add_argument('--compare-outcome-col', type=str, default='TILs score')
 
     # --- gridsearch stage ---
-    parser.add_argument('--input-dir', type=str,
-        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/main_pipeline/test_3_vs_0-2/dev110_test30/binwidth5/pvp_tp_hbp_dwi_b1_adc/clean_partition_select')
+    parser.add_argument('--input-dir', type=str, default=None,
+        help="Partition-stage output dir to read from. Defaults to the same cutoff/sequence-derived "
+             "path as --output-dir when not provided.")
     parser.add_argument('--cv', type=int, default=5)
     parser.add_argument('--scoring', type=str, default='roc_auc')
     parser.add_argument('--n-jobs', type=int, default=6)
 
     # --- train stage ---
-    parser.add_argument('--input-data-dir', type=str,
-        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/main_pipeline/test_3_vs_0-2/dev110_test30/binwidth5/pvp_tp_hbp_dwi_b1_adc/clean_partition_select')
-    parser.add_argument('--input-params-dir', type=str,
-        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/main_pipeline/test_3_vs_0-2/dev110_test30/binwidth5/pvp_tp_hbp_dwi_b1_adc/optimized_params')
+    parser.add_argument('--input-data-dir', type=str, default=None,
+        help="Partition-stage output dir for processed features. Defaults to same cutoff/sequence path.")
+    parser.add_argument('--input-params-dir', type=str, default=None,
+        help="Gridsearch-stage output dir for pickled estimators. Defaults to same cutoff/sequence path.")
     parser.add_argument('--bootstrap', type=int, default=1000)
     parser.add_argument('--threshold', type=float, default=TARGET_THRESHOLD)
     parser.add_argument('--shap', action='store_true')
@@ -1290,15 +1372,26 @@ def parse_arguments():
     if args.icc_path is None:
         args.icc_path = args.path_r1
 
+    cutoff_val = int(args.cutoff) if args.cutoff == int(args.cutoff) else args.cutoff
+    neg_max = int(args.cutoff) - 1
+    cutoff_label = f"test_{cutoff_val}_vs_0-{neg_max}"
+    _base = (f'/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/main_pipeline/'
+             f'{cutoff_label}/dev110_test30/binwidth5/' + "_".join(args.sequences))
+
     if args.output_dir is None:
-        base = ('/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/main_pipeline/'
-                 'test_3_vs_0-2/dev110_test30/binwidth5/' + "_".join(args.sequences))
         if args.stage == 'partition':
-            args.output_dir = f"{base}/clean_partition_select"
+            args.output_dir = f"{_base}/clean_partition_select"
         elif args.stage == 'gridsearch':
-            args.output_dir = f"{base}/optimized_params"
+            args.output_dir = f"{_base}/optimized_params"
         elif args.stage == 'train':
-            args.output_dir = f"{base}/trained_model_outputs"
+            args.output_dir = f"{_base}/trained_model_outputs"
+
+    if args.input_dir is None:
+        args.input_dir = f"{_base}/clean_partition_select"
+    if args.input_data_dir is None:
+        args.input_data_dir = f"{_base}/clean_partition_select"
+    if args.input_params_dir is None:
+        args.input_params_dir = f"{_base}/optimized_params"
 
     return args
 

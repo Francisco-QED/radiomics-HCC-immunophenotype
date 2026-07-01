@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Sweep logs and incremental result files
+scripts/radiomics_utils/sweep_logs/
+scripts/radiomics_utils/sweep_results.csv
+scripts/radiomics_utils/gridsearch_train_results.csv
