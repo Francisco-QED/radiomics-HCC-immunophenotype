@@ -17,9 +17,24 @@ import pandas as pd
 
 PYTHON = "/usr/bin/python3"
 PIPELINE = str(Path(__file__).resolve().parent / "main_pipeline.py")
-SWEEP_RESULTS = Path(__file__).resolve().parent / "sweep_results.csv"
-OUTPUT_CSV = Path(__file__).resolve().parent / "gridsearch_train_results.csv"
+_RESULTS_DIR = (Path.home() / "Library" / "CloudStorage"
+                / "OneDrive-TheMountSinaiHospital"
+                / "Regeneron retrospective radiomics"
+                / "Results" / "main_pipeline" / "immunophenotype")
+
+SWEEP_RESULTS = _RESULTS_DIR / "sweep_results.csv"
+OUTPUT_CSV = _RESULTS_DIR / "gridsearch_train_results.csv"
 LOG_DIR = Path(__file__).resolve().parent / "sweep_logs"
+
+
+# Must match sequence_sweep.py's combo_base_dir exactly -- that's where sequence_sweep.py's
+# partition-stage output for this combo already lives, and where this script's gridsearch/train
+# stages need to read from and write to.
+def combo_base_dir(cutoff, sequences):
+    cutoff_val = int(cutoff)
+    neg_max = cutoff_val - 1
+    cutoff_label = f"tils_{cutoff_val}_vs_0-{neg_max}"
+    return _RESULTS_DIR / cutoff_label / "radiomics" / "binwidth_perseq" / "combinations" / "_".join(sequences)
 
 # Full vocabulary of known sequences -- must stay in sync with sequence_sweep.py's combination rules.
 KNOWN_SEQS = sorted(['dwi_b1', 'dwi_b2', 'ap', 'pvp', 'tp', 'hbp', 'adc', 't2', 'pre'],
@@ -69,9 +84,20 @@ def load_top_combos(top_n):
 
 
 def run_stage(stage, cutoff, sequences, extra_args=None):
+    base = combo_base_dir(cutoff, sequences)
+    if stage == 'gridsearch':
+        io_args = ['--output-dir', str(base / 'optimized_params'),
+                   '--input-dir', str(base / 'clean_partition_select')]
+    elif stage == 'train':
+        io_args = ['--output-dir', str(base / 'trained_model_outputs'),
+                   '--input-data-dir', str(base / 'clean_partition_select'),
+                   '--input-params-dir', str(base / 'optimized_params')]
+    else:
+        io_args = []
+
     cmd = [PYTHON, PIPELINE, '--stage', stage,
            '--cutoff', str(cutoff),
-           '--sequences'] + sequences
+           '--sequences'] + sequences + io_args
     if extra_args:
         cmd += extra_args
     label = f"{stage}_cutoff{cutoff}_{'_'.join(sequences)}"
@@ -85,12 +111,7 @@ def run_stage(stage, cutoff, sequences, extra_args=None):
 
 def parse_train_results(cutoff, sequences):
     """Read the model_comparison.csv written by the train stage."""
-    cutoff_val = int(cutoff)
-    neg_max = cutoff_val - 1
-    cutoff_label = f"test_{cutoff_val}_vs_0-{neg_max}"
-    base = (f"/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/main_pipeline/"
-            f"{cutoff_label}/dev110_test30/binwidth5/{'_'.join(sequences)}/trained_model_outputs")
-    csv_path = Path(base) / "model_comparison.csv"
+    csv_path = combo_base_dir(cutoff, sequences) / "trained_model_outputs" / "model_comparison.csv"
     if not csv_path.exists():
         return None
     return pd.read_csv(csv_path)

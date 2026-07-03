@@ -3,8 +3,16 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Result and data files — keep on T7 Shield, not in repo
+# macOS
+.DS_Store
+
+# Model/pipeline artifacts
+*.pkl
+
+# Result and data files — keep on T7 Shield / OneDrive, not in repo
+Results/
 scripts/radiomics_utils/sweep_logs/
+scripts/radiomics_utils/recurrence_sweep_logs/
 scripts/radiomics_utils/sweep_results.csv
 scripts/radiomics_utils/gridsearch_train_results.csv
 scripts/radiomics_utils/consensus_features.csv

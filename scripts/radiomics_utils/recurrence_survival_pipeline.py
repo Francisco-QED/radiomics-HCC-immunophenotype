@@ -5,7 +5,6 @@ import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
 from lifelines import CoxPHFitter  # <-- FIXED: Added missing import
-from pingouin import intraclass_corr
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import mannwhitneyu, chi2_contingency
@@ -153,34 +152,38 @@ def global_cleanup(df, var_threshold, id_col='PatientID'):
     return df
 
 def interobserver_stability(df, path_r1, path_r2, threshold, id_col='PatientID'):
-    df_reader1 = pd.read_csv(path_r1)
-    df_reader2 = pd.read_csv(path_r2)
+    df_r1 = pd.read_csv(path_r1)
+    df_r2 = pd.read_csv(path_r2)
 
-    common_ids = np.intersect1d(df_reader1[id_col], df_reader2[id_col])
-    r1_sub = df_reader1.set_index(id_col).loc[common_ids].sort_index()
-    r2_sub = df_reader2.set_index(id_col).loc[common_ids].sort_index()
-    
-    features = [f for f in df.columns if f in r1_sub.columns and f in r2_sub.columns and r1_sub[f].dtype != 'object']
-    r1_sub = r1_sub[features]
-    r2_sub = r2_sub[features]
+    common_ids = np.intersect1d(df_r1[id_col], df_r2[id_col])
+    r1 = df_r1.set_index(id_col).loc[common_ids].sort_index()
+    r2 = df_r2.set_index(id_col).loc[common_ids].sort_index()
 
-    print(f"Calculating ICC for {len(features)} features across {len(common_ids)} patients...")
+    features = [f for f in df.columns
+                if f in r1.columns and f in r2.columns and r1[f].dtype != 'object']
+    r1, r2 = r1[features], r2[features]
+    n = len(common_ids)
+    print(f"ICC: {len(features)} features across {n} patients (vectorized)...")
 
-    stable_features = []
-    for feat in tqdm(features, desc="Calculating ICCs", unit="feature"):
-        data = pd.DataFrame({
-            'targets': list(common_ids) * 2,
-            'raters': ['R1'] * len(common_ids) + ['R2'] * len(common_ids),
-            'values': pd.concat([r1_sub[feat], r2_sub[feat]])
-        })
-        try:
-            icc = intraclass_corr(data=data, targets='targets', raters='raters', ratings='values')
-            if icc.set_index('Type').loc['ICC3', 'ICC'] >= threshold:
-                stable_features.append(feat)
-        except:
-            continue
-            
-    return df[stable_features]
+    r1_arr = r1.values.astype(float)
+    r2_arr = r2.values.astype(float)
+    valid   = ~(np.isnan(r1_arr).any(axis=0) | np.isnan(r2_arr).any(axis=0))
+    r1_v, r2_v = r1_arr[:, valid], r2_arr[:, valid]
+    valid_feats = [f for f, v in zip(features, valid) if v]
+
+    gm     = (r1_v.mean(0) + r2_v.mean(0)) / 2
+    sm     = (r1_v + r2_v) / 2
+    SS_b   = 2 * ((sm - gm) ** 2).sum(0)
+    SS_r   = n * ((r1_v.mean(0) - gm) ** 2 + (r2_v.mean(0) - gm) ** 2)
+    SS_tot = ((r1_v - gm) ** 2).sum(0) + ((r2_v - gm) ** 2).sum(0)
+    MS_b   = SS_b / (n - 1)
+    MS_e   = (SS_tot - SS_b - SS_r) / (n - 1)
+    denom  = MS_b + MS_e
+    icc3   = np.where(denom > 0, (MS_b - MS_e) / denom, 0.0)
+
+    stable = [f for f, c in zip(valid_feats, icc3) if c >= threshold]
+    print(f"ICC ≥ {threshold}: {len(stable)} / {len(features)} features kept.")
+    return df[stable]
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 

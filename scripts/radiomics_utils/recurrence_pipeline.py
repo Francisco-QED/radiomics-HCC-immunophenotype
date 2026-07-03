@@ -29,17 +29,17 @@ import seaborn as sns
 from tqdm import tqdm
 
 from scipy.stats import chi2_contingency, mannwhitneyu
-from pingouin import intraclass_corr
 
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold, KFold, GridSearchCV, train_test_split
+from joblib import Parallel, delayed
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis, CoxnetSurvivalAnalysis
 from sksurv.ensemble import RandomSurvivalForest
 from sksurv.metrics import concordance_index_censored, cumulative_dynamic_auc
 
-from lifelines import KaplanMeierFitter
+from lifelines import KaplanMeierFitter, CoxPHFitter
 from lifelines.statistics import logrank_test
 
 # --- Constants -------------------------------------------------------------------
@@ -123,23 +123,27 @@ def interobserver_stability(df, path_r1, path_r2, threshold, id_col='PatientID')
     features = [f for f in df.columns
                 if f in r1.columns and f in r2.columns and r1[f].dtype != 'object']
     r1, r2 = r1[features], r2[features]
-    print(f"ICC: {len(features)} features across {len(common_ids)} patients...")
+    n = len(common_ids)
+    print(f"ICC: {len(features)} features across {n} patients (vectorized)...")
 
-    stable = []
-    for feat in tqdm(features, desc="ICC", unit="feature"):
-        data = pd.DataFrame({
-            'targets': list(common_ids) * 2,
-            'raters':  ['R1'] * len(common_ids) + ['R2'] * len(common_ids),
-            'values':  pd.concat([r1[feat], r2[feat]])
-        })
-        try:
-            icc = intraclass_corr(data=data, targets='targets', raters='raters', ratings='values')
-            if icc.set_index('Type').loc['ICC3', 'ICC'] >= threshold:
-                stable.append(feat)
-        except Exception:
-            continue
+    r1_arr = r1.values.astype(float)
+    r2_arr = r2.values.astype(float)
+    valid   = ~(np.isnan(r1_arr).any(axis=0) | np.isnan(r2_arr).any(axis=0))
+    r1_v, r2_v = r1_arr[:, valid], r2_arr[:, valid]
+    valid_feats = [f for f, v in zip(features, valid) if v]
 
-    print(f"ICC ≥ {threshold}: {len(stable)} of {len(features)} features kept.")
+    gm     = (r1_v.mean(0) + r2_v.mean(0)) / 2
+    sm     = (r1_v + r2_v) / 2
+    SS_b   = 2 * ((sm - gm) ** 2).sum(0)
+    SS_r   = n * ((r1_v.mean(0) - gm) ** 2 + (r2_v.mean(0) - gm) ** 2)
+    SS_tot = ((r1_v - gm) ** 2).sum(0) + ((r2_v - gm) ** 2).sum(0)
+    MS_b   = SS_b / (n - 1)
+    MS_e   = (SS_tot - SS_b - SS_r) / (n - 1)
+    denom  = MS_b + MS_e
+    icc3   = np.where(denom > 0, (MS_b - MS_e) / denom, 0.0)
+
+    stable = [f for f, c in zip(valid_feats, icc3) if c >= threshold]
+    print(f"ICC ≥ {threshold}: {len(stable)} / {len(features)} features kept.")
     return df[stable]
 
 
@@ -149,7 +153,8 @@ def interobserver_stability(df, path_r1, path_r2, threshold, id_col='PatientID')
 
 def partition_with_constraints_survival(df_filtered, outcomes_path, icc_path,
                                         clinical_data_path, event_col, time_col,
-                                        test_size, output_dir, random_state=PARTITION_SEED):
+                                        test_size, output_dir, clinical_output_dir=None,
+                                        random_state=PARTITION_SEED):
     df_outcomes = pd.read_excel(outcomes_path)
     df_icc      = pd.read_csv(icc_path)
 
@@ -179,16 +184,28 @@ def partition_with_constraints_survival(df_filtered, outcomes_path, icc_path,
     y_lock = df_merged.loc[X_lock.index, [event_col, time_col]]
 
     df_clinical = pd.read_excel(clinical_data_path)
+    outcomes_map = df_merged[[event_col, time_col]].rename(
+        columns={event_col: 'Recurrence', time_col: 'Follow-up time (days)'})
+    df_clinical = df_clinical.merge(outcomes_map.reset_index(), on='PatientID', how='left')
+    _clin_dir = clinical_output_dir or output_dir
     df_clinical[df_clinical['PatientID'].isin(X_dev.index)].to_csv(
-        f"{output_dir}/clinical_metadata_dev.csv", index=False)
+        f"{_clin_dir}/clinical_metadata_dev.csv", index=False)
     df_clinical[df_clinical['PatientID'].isin(X_lock.index)].to_csv(
-        f"{output_dir}/clinical_metadata_lock.csv", index=False)
+        f"{_clin_dir}/clinical_metadata_lock.csv", index=False)
 
     n_events_dev  = int(y_dev[event_col].sum())
     n_events_lock = int(y_lock[event_col].sum())
     print(f"Dev:  {len(X_dev)}  ({len(df_must)} ICC-constrained, {n_events_dev} events)")
     print(f"Lock: {len(X_lock)} ({n_events_lock} events)")
     return X_dev, y_dev, X_lock, y_lock
+
+
+CLINICAL_COMPARISON_VARS = [
+    'Age', 'Gender', 'BMI', 'Etiology of liver disease', 'Cirrhosis',
+    'Tumor grade', 'Tumor size (cm)', 'Tumor size on PVP',
+    'Capsule on PVP', 'Mosaic appearance',
+    'Recurrence', 'Follow-up time (days)',
+]
 
 
 def compare_dev_lock_survival(y_dev, y_lock, event_col, time_col, output_dir):
@@ -208,27 +225,104 @@ def compare_dev_lock_survival(y_dev, y_lock, event_col, time_col, output_dir):
     return df
 
 
+def compare_dev_lock_clinical(df_dev, df_lock, variables, output_dir):
+    """Clinical/demographic comparison table between dev and lock sets (Chi-square / Mann-Whitney U)."""
+    results = []
+    for var in variables:
+        if var not in df_dev.columns or var not in df_lock.columns:
+            continue
+        is_cat = df_dev[var].dtype == 'object' or df_dev[var].nunique() < 6
+        if is_cat:
+            dev_tot  = df_dev[var].notna().sum()
+            lock_tot = df_lock[var].notna().sum()
+            def _cat_str(s, tot):
+                return ", ".join(f"{k}: {v} ({v/tot*100:.1f}%)"
+                                 for k, v in s.value_counts().items())
+            dev_str  = _cat_str(df_dev[var],  dev_tot)
+            lock_str = _cat_str(df_lock[var], lock_tot)
+            combined = pd.concat([df_dev[var], df_lock[var]])
+            groups   = pd.Series(['Dev']*len(df_dev) + ['Lock']*len(df_lock),
+                                  index=combined.index)
+            try:
+                _, p, _, _ = chi2_contingency(pd.crosstab(combined, groups))
+            except ValueError:
+                p = np.nan
+            test = 'Chi-Square'
+        else:
+            dv = df_dev[var].dropna()
+            lv = df_lock[var].dropna()
+            def _cont_str(s):
+                q1, med, q3 = s.quantile([0.25, 0.5, 0.75])
+                return f"{med:.1f} [{q1:.1f} – {q3:.1f}]"
+            dev_str  = _cont_str(dv)
+            lock_str = _cont_str(lv)
+            _, p = mannwhitneyu(dv, lv, alternative='two-sided')
+            test = 'Mann-Whitney U'
+        results.append({
+            'Variable': var,
+            f'Dev (N={len(df_dev)})':  dev_str,
+            f'Lock (N={len(df_lock)})': lock_str,
+            'p-value': round(p, 4) if not np.isnan(p) else 'N/A',
+            'Test': test,
+        })
+    df_res = pd.DataFrame(results)
+    df_res.to_excel(f"{output_dir}/dev_lock_clinical_comparison.xlsx", index=False)
+    print("\nDev / Lock clinical comparison:")
+    print(df_res.to_string(index=False))
+    return df_res
+
+
 # ================================================================================
 # Fold-level feature selection (survival)
 # ================================================================================
 
-def calculate_survival_feature_metrics(X, y_struct):
-    """Univariate Cox C-index for each feature. Returns DataFrame indexed by feature."""
-    metrics = []
-    skipped = 0
-    for col in X.columns:
-        try:
-            cox = CoxPHSurvivalAnalysis(tol=1e-3)
-            cox.fit(X[[col]], y_struct)
-            risk = cox.predict(X[[col]])
-            c, _, _, _, _ = concordance_index_censored(y_struct['Status'], y_struct['Time'], risk)
-            hr = float(np.exp(cox.coef_[0]))
-            if np.isnan(c) or hr > 1e4 or hr < 1e-4:
-                skipped += 1
-                continue
-            metrics.append({'Feature': col, 'C_index': c, 'Hazard_Ratio': hr})
-        except Exception:
-            skipped += 1
+def benjamini_hochberg(pvals):
+    pvals = np.asarray(pvals, dtype=float)
+    n = len(pvals)
+    order = np.argsort(pvals)
+    ranked = pvals[order]
+    q = ranked * n / np.arange(1, n + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0, 1)
+    out = np.empty(n)
+    out[order] = q
+    return out
+
+
+def _cox_one_feature(col, x_vals, T_vals, E_int, E_bool):
+    """Univariate Cox fit for one feature. Module-level so joblib can pickle it."""
+    try:
+        df_fit = pd.DataFrame({'T': T_vals, 'E': E_int, 'feature': x_vals})
+        cph = CoxPHFitter(penalizer=0.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cph.fit(df_fit, duration_col='T', event_col='E',
+                    formula='feature', show_progress=False)
+        log_hr = float(cph.params_['feature'])
+        hr     = float(np.exp(log_hr))
+        p      = float(cph.summary.loc['feature', 'p'])
+        risk   = cph.predict_partial_hazard(df_fit).values
+        c, _, _, _, _ = concordance_index_censored(E_bool, T_vals, risk)
+        if np.isnan(c) or np.isnan(p) or hr > 1e4 or hr < 1e-4:
+            return None
+        return {'Feature': col, 'C_index': c, 'log_HR': log_hr, 'Hazard_Ratio': hr, 'p_value': p}
+    except Exception:
+        return None
+
+
+def calculate_survival_feature_metrics(X, y_struct, n_jobs=-1):
+    """Univariate Cox metrics per feature: C-index, log(HR), HR, Wald p-value."""
+    T_vals = y_struct['Time']
+    E_int  = y_struct['Status'].astype(int)
+    E_bool = y_struct['Status']
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_cox_one_feature)(col, X[col].values, T_vals, E_int, E_bool)
+        for col in X.columns
+    )
+
+    metrics = [r for r in results if r is not None]
+    skipped = len(X.columns) - len(metrics)
     if skipped:
         print(f"  Univariate Cox: {skipped} features skipped (fit failure / numerical issue).")
     if not metrics:
@@ -247,8 +341,8 @@ def spearman_filter(df, threshold, tie_breaker_series):
             if f1 not in to_drop and f2 not in to_drop:
                 if corr.loc[f1, f2] > threshold:
                     if tie_breaker_series is not None:
-                        # Keep the feature with higher C-index
-                        if tie_breaker_series[f1] >= tie_breaker_series[f2]:
+                        # Keep the feature with the lower p-value (more significant)
+                        if tie_breaker_series[f1] <= tie_breaker_series[f2]:
                             to_drop.add(f2)
                         else:
                             to_drop.add(f1)
@@ -258,29 +352,41 @@ def spearman_filter(df, threshold, tie_breaker_series):
 
 
 def _select_lasso_cox_alpha(X, y_struct, alphas, n_inner=3, random_state=RANDOM_STATE):
-    """Inner CV to select the best LASSO-Cox regularisation strength."""
+    """Inner CV: fit full regularisation path once per fold (warm starts), pick best alpha."""
+    alphas_desc = np.sort(alphas)[::-1].tolist()
     kf = KFold(n_splits=n_inner, shuffle=True, random_state=random_state)
-    best_alpha, best_score = alphas[0], -np.inf
-    for alpha in alphas:
-        scores = []
-        for tr_idx, va_idx in kf.split(X):
-            try:
-                m = CoxnetSurvivalAnalysis(alphas=[alpha], l1_ratio=1.0, max_iter=1000)
-                m.fit(X.iloc[tr_idx], y_struct[tr_idx])
-                scores.append(m.score(X.iloc[va_idx], y_struct[va_idx]))
-            except Exception:
-                pass
-        if scores and np.mean(scores) > best_score:
-            best_score = np.mean(scores)
-            best_alpha = alpha
-    return best_alpha
+    alpha_scores = np.zeros(len(alphas_desc))
+    alpha_counts = np.zeros(len(alphas_desc))
+
+    for tr_idx, va_idx in kf.split(X):
+        try:
+            m = CoxnetSurvivalAnalysis(alphas=alphas_desc, l1_ratio=1.0, max_iter=1000)
+            m.fit(X.iloc[tr_idx], y_struct[tr_idx])
+            for i, alpha in enumerate(alphas_desc):
+                try:
+                    risk = m.predict(X.iloc[va_idx], alpha=alpha)
+                    c = concordance_index_censored(
+                        y_struct[va_idx]['Status'], y_struct[va_idx]['Time'], risk
+                    )[0]
+                    if not np.isnan(c):
+                        alpha_scores[i] += c
+                        alpha_counts[i] += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if alpha_counts.max() == 0:
+        return float(alphas_desc[-1])
+    mean_scores = np.where(alpha_counts > 0, alpha_scores / alpha_counts, -np.inf)
+    return float(alphas_desc[np.argmax(mean_scores)])
 
 
 def run_fold_pruning_survival(X_tr, y_tr_struct, target_count,
-                               c_index_cutoff=0.6, random_state=RANDOM_STATE):
+                               hr_cutoff=1.5, q_cutoff=0.20, random_state=RANDOM_STATE):
     """
     Per-fold feature selection:
-      impute → scale → univariate Cox C-index filter → Spearman → LASSO-Cox (inner CV alpha).
+      impute → scale → HR screen + FDR filter → Spearman → LASSO-Cox (inner CV alpha).
     Returns selected feature names + fit preprocessing objects.
     """
     imputer = KNNImputer(n_neighbors=5)
@@ -290,22 +396,33 @@ def run_fold_pruning_survival(X_tr, y_tr_struct, target_count,
 
     scorecard = calculate_survival_feature_metrics(X_sc, y_tr_struct)
 
-    # Two-sided C-index filter: keep if C-index > cutoff OR < (1 - cutoff)
-    lower = 1.0 - c_index_cutoff
-    mask  = (scorecard['C_index'] >= c_index_cutoff) | (scorecard['C_index'] <= lower)
-    kept  = scorecard[mask]
-    print(f"  Univariate C-index filter (≥{c_index_cutoff} or ≤{lower:.2f}): "
-          f"{len(kept)} / {len(scorecard)} features pass.")
+    # Effect-size screen: keep |log(HR)| > log(hr_cutoff) (both protective and harmful)
+    log_hr_thresh = np.log(hr_cutoff)
+    mask_hr = scorecard['log_HR'].abs() > log_hr_thresh
+    screened = scorecard[mask_hr].copy()
+    print(f"  HR screen (|log HR| > {log_hr_thresh:.3f}, HR cutoff={hr_cutoff}): "
+          f"{len(screened)} / {len(scorecard)} features pass.")
+
+    if len(screened) == 0:
+        raise RuntimeError(
+            f"No features passed the HR screen (cutoff={hr_cutoff}). "
+            "Lower --hr-cutoff and re-run."
+        )
+
+    # FDR within screened pool (Benjamini-Hochberg)
+    screened['p_fdr'] = benjamini_hochberg(screened['p_value'].values)
+    kept = screened[screened['p_fdr'] < q_cutoff]
+    print(f"  FDR within screened pool (q<{q_cutoff}): {len(kept)} / {len(screened)} features pass.")
 
     if len(kept) == 0:
         raise RuntimeError(
-            f"No features passed the C-index filter (threshold={c_index_cutoff}). "
-            "Lower --c-index-cutoff and re-run."
+            f"No features survived FDR filter (q<{q_cutoff}) within HR-screened pool. "
+            "Raise --q-cutoff and re-run."
         )
 
     X_filt = X_sc[kept.index]
     n0 = X_filt.shape[1]
-    X_sp = spearman_filter(X_filt, threshold=0.85, tie_breaker_series=scorecard.loc[kept.index, 'C_index'])
+    X_sp = spearman_filter(X_filt, threshold=0.85, tie_breaker_series=kept['p_value'])
     print(f"  Spearman: {n0} → {X_sp.shape[1]} features.")
 
     alphas = np.logspace(-4, 1, 20)
@@ -334,7 +451,7 @@ def run_fold_pruning_survival(X_tr, y_tr_struct, target_count,
 # ================================================================================
 
 def run_cross_validation_survival(X, y_dev_df, event_col, time_col, target_count,
-                                   c_index_cutoff=0.6, random_state=RANDOM_STATE):
+                                   hr_cutoff=1.5, q_cutoff=0.20, random_state=RANDOM_STATE):
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
     events = y_dev_df[event_col]
 
@@ -350,7 +467,8 @@ def run_cross_validation_survival(X, y_dev_df, event_col, time_col, target_count
         y_tr_struct = make_survival_array(y_tr_df[event_col], y_tr_df[time_col])
 
         selected_coefs, imputer, scaler, spearman_feats, lasso, scorecard = run_fold_pruning_survival(
-            X_tr, y_tr_struct, target_count, c_index_cutoff=c_index_cutoff, random_state=random_state
+            X_tr, y_tr_struct, target_count,
+            hr_cutoff=hr_cutoff, q_cutoff=q_cutoff, random_state=random_state
         )
 
         fold_coefficients.loc[selected_coefs.index, f'Fold_{fold+1}'] = selected_coefs.values
@@ -710,6 +828,9 @@ def load_preprocessed_survival(in_dir):
 
 def run_partition_stage(args):
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    # Three levels up from binwidth_perseq/{seq_tag}/partition_select/ → recurrence_survival/
+    _recurrence_dir = str(Path(args.output_dir).parents[2])
+    Path(_recurrence_dir).mkdir(parents=True, exist_ok=True)
 
     df_all = pd.read_csv(args.features_path, index_col=0)
     df_filtered = preselect_sequences(df_all, allowed_sequences=args.sequences)
@@ -723,9 +844,10 @@ def run_partition_stage(args):
         time_col=args.time_col,
         test_size=args.test_size,
         output_dir=args.output_dir,
+        clinical_output_dir=_recurrence_dir,
     )
 
-    compare_dev_lock_survival(y_dev, y_lock, args.event_col, args.time_col, args.output_dir)
+    compare_dev_lock_survival(y_dev, y_lock, args.event_col, args.time_col, _recurrence_dir)
 
     X_dev_clean     = global_cleanup(X_dev, cv_threshold=args.cv_threshold)
     X_dev_clean_icc = interobserver_stability(X_dev_clean, args.path_r1, args.path_r2,
@@ -739,7 +861,7 @@ def run_partition_stage(args):
         X_dev_clean_icc, y_dev_filtered,
         event_col=args.event_col, time_col=args.time_col,
         target_count=args.lasso_target_count,
-        c_index_cutoff=args.c_index_cutoff,
+        hr_cutoff=args.hr_cutoff, q_cutoff=args.q_cutoff,
         random_state=RANDOM_STATE,
     )
 
@@ -748,6 +870,7 @@ def run_partition_stage(args):
         n_bootstrap=1000, random_state=RANDOM_STATE,
     )
 
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)  # re-assert in case drive remounted
     fold_coefficients.to_csv(f"{args.output_dir}/lasso_coeffs_fold.csv")
     global_scorecard.to_csv(f"{args.output_dir}/univariate_cox_metrics.csv")
     pd.DataFrame([nested_cv_result]).to_csv(f"{args.output_dir}/nested_cv_diagnostics.csv", index=False)
@@ -758,6 +881,15 @@ def run_partition_stage(args):
     ]
     consensus_features = frequent.head(args.target_feature_count).index.tolist()
     print(f"\nConsensus features ({len(consensus_features)}): {consensus_features}")
+
+    if len(consensus_features) == 0:
+        print("No features survived min_fold_n + sign-stability filters — "
+              "likely no predictive signal in this sequence set. "
+              "Saving diagnostics and exiting partition stage early.")
+        pd.Series([], name='feature', dtype=str).to_csv(
+            f"{args.output_dir}/consensus_features.csv", index=False)
+        print(f"Output: {args.output_dir}")
+        return
 
     # Final preprocessing: fit on dev, apply to lock
     imputer = KNNImputer(n_neighbors=5)
@@ -895,8 +1027,10 @@ def parse_arguments():
     parser.add_argument('--cv-threshold', type=float, default=0.1)
     parser.add_argument('--icc-threshold', type=float, default=0.85)
     parser.add_argument('--lasso-target-count', type=int, default=100)
-    parser.add_argument('--c-index-cutoff', type=float, default=0.6,
-        help="Univariate Cox C-index threshold (features above this OR below 1-threshold are kept).")
+    parser.add_argument('--hr-cutoff', type=float, default=1.5,
+        help="Hazard ratio threshold for effect-size screen: keep |log(HR)| > log(hr_cutoff).")
+    parser.add_argument('--q-cutoff', type=float, default=0.50,
+        help="FDR q-value threshold (Benjamini-Hochberg) within the HR-screened pool.")
     parser.add_argument('--min-fold-n', type=int, default=3,
         help="Minimum number of folds a feature must appear in for consensus.")
     parser.add_argument('--target-feature-count', type=int, default=15,
@@ -926,7 +1060,8 @@ def parse_arguments():
         args.icc_path = args.path_r1
 
     seq_tag = "_".join(args.sequences)
-    _base_out = f"{_base_data}/Results/main_pipeline/recurrence_survival/binwidth_perseq/{seq_tag}"
+    _local_results = str(Path.home() / "Library" / "CloudStorage" / "OneDrive-TheMountSinaiHospital" / "Regeneron retrospective radiomics" / "Results" / "main_pipeline" / "recurrence_survival" / "binwidth_perseq")
+    _base_out = f"{_local_results}/{seq_tag}"
     _partition_dir  = f"{_base_out}/partition_select"
     _gridsearch_dir = f"{_base_out}/optimized_params"
     _train_dir      = f"{_base_out}/trained_model_outputs"

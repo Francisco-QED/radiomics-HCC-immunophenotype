@@ -16,7 +16,6 @@
 
 import argparse
 import itertools
-import re
 import subprocess
 import sys
 import time
@@ -33,8 +32,33 @@ CUTOFFS = [2, 3]
 MIN_CONTRAST = 2
 MAX_TOTAL_SEQS = 5
 
+_RESULTS_DIR = (Path.home() / "Library" / "CloudStorage"
+                / "OneDrive-TheMountSinaiHospital"
+                / "Regeneron retrospective radiomics"
+                / "Results" / "main_pipeline" / "immunophenotype")
+
 LOG_DIR = Path(__file__).resolve().parent / "sweep_logs"
-RESULTS_CSV = Path(__file__).resolve().parent / "sweep_results.csv"
+RESULTS_CSV = _RESULTS_DIR / "sweep_results.csv"
+
+
+# main_pipeline.py's own default --output-dir no longer has a per-sequence-combo segment (it
+# routes single fixed-sequence runs to .../radiomics or .../clinical+radiomics), so the sweep must
+# pass --output-dir explicitly per combo or every combo would collide into the same folder.
+def combo_base_dir(cutoff, sequences):
+    cutoff_val = int(cutoff)
+    neg_max = cutoff_val - 1
+    cutoff_label = f"tils_{cutoff_val}_vs_0-{neg_max}"
+    return _RESULTS_DIR / cutoff_label / "radiomics" / "binwidth_perseq" / "combinations" / "_".join(sequences)
+
+
+# Shared per-cutoff location for artifacts that don't depend on which sequences are used (dev/lock
+# split, clinical_metadata_dev/lock.csv, dev_test_comparison.xlsx) -- computed once per cutoff
+# instead of duplicated into every combo's own folder. Sibling of "combinations/" under binwidth_perseq.
+def summary_results_dir(cutoff):
+    cutoff_val = int(cutoff)
+    neg_max = cutoff_val - 1
+    cutoff_label = f"tils_{cutoff_val}_vs_0-{neg_max}"
+    return _RESULTS_DIR / cutoff_label / "radiomics" / "binwidth_perseq" / "summary_results"
 
 
 def generate_sequence_sets():
@@ -60,7 +84,9 @@ def generate_sequence_sets():
 
 
 def run_one(cutoff, sequences):
-    cmd = [PYTHON, PIPELINE, "--stage", "partition", "--cutoff", str(cutoff), "--sequences"] + sequences
+    output_dir = combo_base_dir(cutoff, sequences) / "clean_partition_select"
+    cmd = [PYTHON, PIPELINE, "--stage", "partition", "--cutoff", str(cutoff), "--sequences"] + sequences \
+        + ["--output-dir", str(output_dir), "--clinical-output-dir", str(summary_results_dir(cutoff))]
     label = f"cutoff{cutoff}_{'_'.join(sequences)}"
     log_path = LOG_DIR / f"{label}.log"
 
@@ -70,16 +96,11 @@ def run_one(cutoff, sequences):
 
     log_path.write_text(proc.stdout + "\n--- STDERR ---\n" + proc.stderr)
 
-    output_dir = None
-    m = re.search(r"^Output directory: (.+)$", proc.stdout, re.MULTILINE)
-    if m:
-        output_dir = m.group(1).strip()
-
     row = {
         "cutoff": cutoff,
         "sequences": "_".join(sequences),
         "n_sequences": len(sequences),
-        "output_dir": output_dir,
+        "output_dir": str(output_dir),
         "elapsed_sec": round(elapsed, 1),
         "status": "success" if proc.returncode == 0 else "failed",
         "log_path": str(log_path),
@@ -90,8 +111,8 @@ def run_one(cutoff, sequences):
         return row
 
     try:
-        nested_cv = pd.read_csv(Path(output_dir) / "nested_cv_diagnostics.csv")
-        consensus = pd.read_csv(Path(output_dir) / "consensus_features.csv")
+        nested_cv = pd.read_csv(output_dir / "nested_cv_diagnostics.csv")
+        consensus = pd.read_csv(output_dir / "consensus_features.csv")
         best = nested_cv.loc[nested_cv["oof_auc"].idxmax()]
         row.update({
             "n_consensus_features": len(consensus),
@@ -124,6 +145,7 @@ def main():
         return
 
     LOG_DIR.mkdir(exist_ok=True)
+    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     results = []
     run_idx = 0
     for cutoff in CUTOFFS:

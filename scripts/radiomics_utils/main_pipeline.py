@@ -36,7 +36,6 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from scipy.stats import mannwhitneyu, chi2_contingency
-from pingouin import intraclass_corr
 
 from sklearn.svm import SVC
 from sklearn.impute import KNNImputer
@@ -93,6 +92,80 @@ def preselect_sequences(df, allowed_sequences, id_col='PatientID'):
     return filtered_df
 
 
+# --- Clinical / MRI semantic features -----------------------------------------------------------
+# Non-radiomics features from the clinical/imaging metadata sheet, engineered to be numeric and
+# concatenated onto the radiomics feature matrix (see run_partition_stage) so LASSO can select from
+# the combined pool exactly like any other feature. Prefixed so downstream code can identify them
+# (e.g. to skip the radiomics-only ICC filter, which has no inter-reader analogue for these).
+#
+# Feature set is deliberately narrow: only baseline (pre-operative) variables that are both
+# consistently coded and have real variance in this cohort. Excluded on purpose:
+#   - Everything derived from the resection specimen (Tumor size (cm), Tumor grade, Tumor stage,
+#     Histopathologic characteristics, Tumor_differentiation) -- not known at baseline, and Tumor
+#     grade in particular is assigned on the same specimen the TILs outcome is scored from.
+#   - Most "Qualitative MRI evaluation" columns (Morphology, Margin, Internal arteries,
+#     Macrovascular invasion, Tumor necrosis, Fat content, Restricted diffusion, Enhancement
+#     characteristics, LI-RADS, HBP signal) -- >85% single-category in this cohort (e.g. Morphology
+#     is 145/147 "Nodular"), some also inconsistently coded (typos, stray "N/a" strings, LI-RADS
+#     values like "FNH?" that aren't valid LI-RADS codes).
+CLINICAL_FEATURE_PREFIX = 'clinical_'
+
+# T2 signal free text, case-normalized: hypointense-leaning (Iso/Hypo) vs hyperintense-leaning
+# (Mild/Mild Hyper/Hyper) -- "Mild Hyper" and "Mild hyper" are the same category with inconsistent
+# capitalization in the source sheet.
+_T2_ISOHYPO = {'iso', 'hypo'}
+_T2_HYPER = {'mild', 'mild hyper', 'hyper'}
+
+
+# Buckets the free-text, often multi-label "Etiology of liver disease" field into a single
+# category per patient, checked in this priority order:
+#   1. Viral (HBV or HCV present anywhere in the field)
+#   2. Steatosis-related (MASH/NASH/MASLD/NAFLD/steatosis), only reached if not viral
+#   3. Other (EtOH, Unknown/NaN, and incidental comorbidities like "Multiple Myeloma" that clearly
+#      aren't a liver-disease etiology) -- each too rare on its own to be its own category
+# The order matters: a patient listed as "HCV, MASH" returns 'Viral', never reaching the MASH
+# check, since viral hepatitis is the dominant/primary driver when both are present.
+def _classify_etiology(text):
+    if pd.isna(text):
+        return 'Other'
+    t = str(text).lower()
+    if 'hbv' in t or 'hcv' in t:
+        return 'Viral'
+    if any(k in t for k in ('mash', 'nash', 'masld', 'nafld', 'steatosis')):
+        return 'MASLD/MASH/NASH/NAFLD'
+    return 'Other'
+
+
+# Loads and encodes the clinical/MRI semantic features from the clinical metadata sheet into a
+# numeric, model-ready DataFrame indexed by PatientID.
+def load_clinical_features(clinical_data_path, id_col='PatientID'):
+    df = pd.read_excel(clinical_data_path).set_index(id_col)
+    out = pd.DataFrame(index=df.index)
+
+    out[f'{CLINICAL_FEATURE_PREFIX}Age'] = df['Age']
+    out[f'{CLINICAL_FEATURE_PREFIX}BMI'] = df['BMI']
+    out[f'{CLINICAL_FEATURE_PREFIX}Gender_M'] = (df['Gender'] == 'M').astype(float)
+    out[f'{CLINICAL_FEATURE_PREFIX}Cirrhosis_Y'] = df['Cirrhosis'].map({'Y': 1.0, 'N': 0.0})
+    # AFP is classically log-normally distributed (here spanning ~2 to ~13,900) -- log1p keeps a
+    # handful of extreme values from dominating the later z-score/LASSO step.
+    out[f'{CLINICAL_FEATURE_PREFIX}AFP_log'] = np.log1p(df['Serum AFP'])
+
+    out[f'{CLINICAL_FEATURE_PREFIX}Capsule_PVP_Y'] = df['Capsule (on PVP yes/no)'].map({'Yes': 1.0, 'No': 0.0})
+    out[f'{CLINICAL_FEATURE_PREFIX}Mosaic_Y'] = df['Mosaic appearance (yes/no)'].map({'Yes': 1.0, 'No': 0.0})
+    out[f'{CLINICAL_FEATURE_PREFIX}TumorSize_PVP'] = df['Maximum tumor size on T1 portal venous phase (PVP)']
+
+    t2 = df['T2 signal (Iso, hypo, Mild, marked Hyperintensity)'].str.strip().str.lower()
+    out[f'{CLINICAL_FEATURE_PREFIX}T2_Hyper'] = np.select(
+        [t2.isin(_T2_ISOHYPO), t2.isin(_T2_HYPER)], [0.0, 1.0], default=np.nan)
+
+    etiology_group = df['Etiology of liver disease'].apply(_classify_etiology)
+    etiology_dummies = pd.get_dummies(etiology_group, prefix=f'{CLINICAL_FEATURE_PREFIX}Etiology', dtype=float)
+    out = out.join(etiology_dummies)
+
+    print(f"Loaded {out.shape[1]} clinical features for {out.shape[0]} patients from: {clinical_data_path}")
+    return out
+
+
 # --- Partitioning with ICC and lock set constraints -------------------------------------------------
 # Partition the data into development and lock sets. Ensure all inter-reader patients remain in the
 # development set, while the remaining pool is stratified by outcome for the lock set.
@@ -105,7 +178,8 @@ def preselect_sequences(df, allowed_sequences, id_col='PatientID'):
 # cutoff: Threshold for binarizing the outcome variable.
 # test_size: Number of patients to include in the lock set.
 def partition_with_constraints(df_filtered, outcomes_path, icc_path, clinical_data_path, label_col,
-                                cutoff, test_size, output_dir, random_state=PARTITION_SEED):
+                                cutoff, test_size, output_dir, random_state=PARTITION_SEED,
+                                clinical_output_dir=None):
     df_outcomes = pd.read_excel(outcomes_path)
     df_outcomes['y_bin'] = (df_outcomes[label_col] >= cutoff).astype(int)
     df_icc = pd.read_csv(icc_path)
@@ -132,11 +206,22 @@ def partition_with_constraints(df_filtered, outcomes_path, icc_path, clinical_da
     y_dev = pd.concat([df_dev_must['y_bin'], y_dev_rest])
 
     df_clinical = pd.read_excel(clinical_data_path)
+    # Outcome columns (TILs_resection, TLS_resection, ...) live in outcomes_path, not the clinical
+    # metadata sheet -- merged in here so compare_dev_test can use them (e.g. as --compare-outcome-col)
+    # without depending on a duplicate copy sitting inside the clinical sheet.
+    outcome_cols = [c for c in df_outcomes.columns if c not in ('PatientID', 'y_bin')]
+    df_clinical = df_clinical.merge(df_outcomes[['PatientID'] + outcome_cols], on='PatientID', how='left')
     df_clinical_dev = df_clinical[df_clinical['PatientID'].isin(X_dev.index)]
     df_clinical_lock = df_clinical[df_clinical['PatientID'].isin(X_lock.index)]
 
-    df_clinical_dev.to_csv(f"{output_dir}/clinical_metadata_dev.csv", index=False)
-    df_clinical_lock.to_csv(f"{output_dir}/clinical_metadata_lock.csv", index=False)
+    # The dev/lock split (and everything derived from it here) depends only on cutoff/test_size/
+    # random_state, never on which sequences are in df_filtered -- so a sweep over sequence combos
+    # can point clinical_output_dir at one shared location instead of writing N identical copies
+    # into N per-combo folders. Defaults to output_dir for a plain, non-sweep single run.
+    _clin_dir = clinical_output_dir or output_dir
+    Path(_clin_dir).mkdir(parents=True, exist_ok=True)
+    df_clinical_dev.to_csv(f"{_clin_dir}/clinical_metadata_dev.csv", index=False)
+    df_clinical_lock.to_csv(f"{_clin_dir}/clinical_metadata_lock.csv", index=False)
 
     print("Partitioning Complete.")
     print(f"Dev Set: {len(X_dev)} (Includes {len(df_dev_must)} ICC patients)")
@@ -248,33 +333,38 @@ def global_cleanup(df, cv_threshold, id_col='PatientID'):
 # Calculates the ICC for each feature across the two readers, keeping only those above threshold.
 # df: cleaned-up X_dev from "global_cleanup"
 def interobserver_stability(df, path_r1, path_r2, threshold, id_col='PatientID'):
-    df_reader1 = pd.read_csv(path_r1)
-    df_reader2 = pd.read_csv(path_r2)
+    df_r1 = pd.read_csv(path_r1)
+    df_r2 = pd.read_csv(path_r2)
 
-    common_ids = np.intersect1d(df_reader1[id_col], df_reader2[id_col])
-    r1_sub = df_reader1.set_index(id_col).loc[common_ids].sort_index()
-    r2_sub = df_reader2.set_index(id_col).loc[common_ids].sort_index()
-    features = [f for f in df.columns if f in r1_sub.columns and f in r2_sub.columns and r1_sub[f].dtype != 'object']
-    r1_sub = r1_sub[features]
-    r2_sub = r2_sub[features]
-    print(f"Calculating ICC for {len(features)} features across {len(common_ids)} patients...")
+    common_ids = np.intersect1d(df_r1[id_col], df_r2[id_col])
+    r1 = df_r1.set_index(id_col).loc[common_ids].sort_index()
+    r2 = df_r2.set_index(id_col).loc[common_ids].sort_index()
 
-    stable_features = []
+    features = [f for f in df.columns
+                if f in r1.columns and f in r2.columns and r1[f].dtype != 'object']
+    r1, r2 = r1[features], r2[features]
+    n = len(common_ids)
+    print(f"ICC: {len(features)} features across {n} patients (vectorized)...")
 
-    for feat in tqdm(features, desc="Calculating ICCs", unit="feature"):
-        data = pd.DataFrame({
-            'targets': list(common_ids) * 2,
-            'raters': ['R1'] * len(common_ids) + ['R2'] * len(common_ids),
-            'values': pd.concat([r1_sub[feat], r2_sub[feat]])
-        })
-        try:
-            icc = intraclass_corr(data=data, targets='targets', raters='raters', ratings='values')
-            if icc.set_index('Type').loc['ICC3', 'ICC'] >= threshold:   # two-way mixed effects, absolute agreement
-                stable_features.append(feat)
-        except Exception:
-            continue
+    r1_arr = r1.values.astype(float)
+    r2_arr = r2.values.astype(float)
+    valid   = ~(np.isnan(r1_arr).any(axis=0) | np.isnan(r2_arr).any(axis=0))
+    r1_v, r2_v = r1_arr[:, valid], r2_arr[:, valid]
+    valid_feats = [f for f, v in zip(features, valid) if v]
 
-    return df[stable_features]
+    gm     = (r1_v.mean(0) + r2_v.mean(0)) / 2
+    sm     = (r1_v + r2_v) / 2
+    SS_b   = 2 * ((sm - gm) ** 2).sum(0)
+    SS_r   = n * ((r1_v.mean(0) - gm) ** 2 + (r2_v.mean(0) - gm) ** 2)
+    SS_tot = ((r1_v - gm) ** 2).sum(0) + ((r2_v - gm) ** 2).sum(0)
+    MS_b   = SS_b / (n - 1)
+    MS_e   = (SS_tot - SS_b - SS_r) / (n - 1)
+    denom  = MS_b + MS_e
+    icc3   = np.where(denom > 0, (MS_b - MS_e) / denom, 0.0)
+
+    stable = [f for f, c in zip(valid_feats, icc3) if c >= threshold]
+    print(f"ICC ≥ {threshold}: {len(stable)} / {len(features)} features kept.")
+    return df[stable]
 
 
 # --- Fold-specific preprocessing and feature selection -----------------------------------------------
@@ -1189,6 +1279,14 @@ def run_partition_stage(args):
     df_all_seq = pd.read_csv(args.features_path, index_col=0)
     df_filtered = preselect_sequences(df_all_seq, allowed_sequences=args.sequences)
 
+    if args.feature_set == 'both':
+        # Joined AFTER sequence preselection: preselect_sequences keeps any column whose name
+        # contains a sequence string, and several clinical column names (e.g. "Capsule on PVP")
+        # would otherwise collide with sequence substrings like "pvp".
+        df_clinical_feats = load_clinical_features(args.clinical_data_path)
+        df_filtered = df_filtered.join(df_clinical_feats, how='left')
+        print(f"Joined clinical features. Feature matrix now has {df_filtered.shape[1]} columns.")
+
     X_dev, y_dev, X_lock, y_lock, df_clinical_dev, df_clinical_lock = partition_with_constraints(
         df_filtered,
         args.outcomes_path,
@@ -1198,14 +1296,24 @@ def run_partition_stage(args):
         cutoff=args.cutoff,
         test_size=args.test_size,
         output_dir=args.output_dir,
+        clinical_output_dir=args.clinical_output_dir,
     )
 
+    _clin_dir = args.clinical_output_dir or args.output_dir
     compare_dev_test(df_clinical_dev, df_clinical_lock, args.compare_variables,
-                      output_dir=args.output_dir, outcome_col=args.compare_outcome_col)
+                      output_dir=_clin_dir, outcome_col=args.compare_outcome_col)
 
     X_dev_clean = global_cleanup(X_dev, id_col='PatientID', cv_threshold=args.cv_threshold)
-    X_dev_clean_icc = interobserver_stability(X_dev_clean, args.path_r1, args.path_r2,
+
+    clinical_cols = [c for c in X_dev_clean.columns if c.startswith(CLINICAL_FEATURE_PREFIX)]
+    radiomics_cols = [c for c in X_dev_clean.columns if c not in clinical_cols]
+    X_dev_clean_icc = interobserver_stability(X_dev_clean[radiomics_cols], args.path_r1, args.path_r2,
                                                id_col='PatientID', threshold=args.icc_threshold)
+    if clinical_cols:
+        # Clinical/semantic features have no double-reader segmentation, so ICC doesn't apply to
+        # them -- they pass straight through to the same fold-specific selection as everything else.
+        X_dev_clean_icc = pd.concat([X_dev_clean_icc, X_dev_clean[clinical_cols]], axis=1)
+        print(f"Clinical features bypass ICC filter, added back: {len(clinical_cols)}")
 
     y_dev_filtered = y_dev.loc[X_dev_clean_icc.index]
     print(f"After filtering: X_dev has {X_dev_clean_icc.shape[0]} samples, "
@@ -1217,6 +1325,11 @@ def run_partition_stage(args):
         metric_cutoff=args.metric_cutoff, random_state=RANDOM_STATE,
     )
     fold_coefficients.to_csv(f"{args.output_dir}/lasso_coeffs_fold.csv", index=True)
+
+    frequent_features = fold_coefficients[
+        (fold_coefficients['Selection_Frequency'] >= args.min_fold_n) & fold_coefficients['Sign_Stable']
+    ]
+    consensus_features = frequent_features.head(args.target_feature_count).index.tolist()
 
     # Honest, dev-only nested CV estimate: how well does the whole selection+fit pipeline
     # generalize, pooled across all of X_dev rather than the much smaller lock set. Never touches
@@ -1231,10 +1344,6 @@ def run_partition_stage(args):
     print(nested_cv_summary.to_string(index=False))
     print(f"{'='*100}\n")
 
-    frequent_features = fold_coefficients[
-        (fold_coefficients['Selection_Frequency'] >= args.min_fold_n) & fold_coefficients['Sign_Stable']
-    ]
-    consensus_features = frequent_features.head(args.target_feature_count).index.tolist()
     print(f"Consensus features identified: {len(consensus_features)}")
     print(consensus_features)
     global_scorecard.to_csv(f"{args.output_dir}/univariate_metrics.csv")
@@ -1311,11 +1420,11 @@ def parse_arguments():
     # --- partition stage ---
     parser.add_argument('--sequences', nargs='+', default=['pvp', 'tp', 'hbp', 'dwi_b1', 'adc'])
     parser.add_argument('--features-path', type=str,
-        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/SA1_2/R-SA1_2_I-sitkBSpline_S-1mm_W-5.csv')
+        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/SA1_2/R-SA1_2_I-sitkBSpline_S-1mm_W-perseq.csv')
     parser.add_argument('--path-r1', type=str,
-        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/inter-reader/R-Reader1_I-sitkBSpline_S-1mm_W-5.csv')
+        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/inter-reader/Reader1/R-Reader1_I-sitkBSpline_S-1mm_W-perseq.csv')
     parser.add_argument('--path-r2', type=str,
-        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/inter-reader/R-Reader2_I-sitkBSpline_S-1mm_W-5.csv')
+        default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/inter-reader/Reader2/R-Reader2_I-sitkBSpline_S-1mm_W-perseq.csv')
     parser.add_argument('--outcomes-path', type=str,
         default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/databases/immunophenotype_outcomes.xlsx')
     parser.add_argument('--clinical-data-path', type=str,
@@ -1341,10 +1450,21 @@ def parse_arguments():
     parser.add_argument('--min-fold-n', type=int, default=3)
     parser.add_argument('--target-feature-count', type=int, default=10)
     parser.add_argument('--compare-variables', nargs='+', default=[
-        'Age', 'Gender', 'BMI', 'Cirrhosis', 'Capsule on PVP', 'Mosaic appearance',
-        'Macrovascular invasion', 'Tumor size on PVP', 'TILs score', 'TLS score',
+        'Age', 'Gender', 'BMI', 'Cirrhosis', 'Capsule (on PVP yes/no)', 'Mosaic appearance (yes/no)',
+        'Macrovascular invasion (yes/no)', 'Maximum tumor size on T1 portal venous phase (PVP)',
+        'TILs_resection', 'TLS_resection',
     ])
-    parser.add_argument('--compare-outcome-col', type=str, default='TILs score')
+    parser.add_argument('--compare-outcome-col', type=str, default='TILs_resection')
+    parser.add_argument('--clinical-output-dir', type=str, default=None,
+        help="Where clinical_metadata_dev/lock.csv and dev_test_comparison.xlsx get written. "
+             "Defaults to --output-dir. Sweeps over sequence combos should point this at one shared "
+             "location, since the dev/lock split doesn't depend on which sequences are used.")
+    parser.add_argument('--feature-set', choices=['radiomics', 'both'], default='radiomics',
+        help="'radiomics' (default): current behavior, unaffected. 'both': encoded clinical/MRI "
+             "semantic features (age, gender, BMI, AFP, cirrhosis, etiology, capsule on PVP, mosaic "
+             "appearance, T2 signal, tumor size on PVP) appended to the radiomics matrix, treated "
+             "like any other feature for LASSO to select from. The clinical-only benchmark lives in "
+             "its own script (clinical_only_pipeline.py), not here.")
 
     # --- gridsearch stage ---
     parser.add_argument('--input-dir', type=str, default=None,
@@ -1375,9 +1495,13 @@ def parse_arguments():
 
     cutoff_val = int(args.cutoff) if args.cutoff == int(args.cutoff) else args.cutoff
     neg_max = int(args.cutoff) - 1
-    cutoff_label = f"test_{cutoff_val}_vs_0-{neg_max}"
-    _base = (f'/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/main_pipeline/'
-             f'{cutoff_label}/dev110_test30/binwidth5/' + "_".join(args.sequences))
+    cutoff_label = f"tils_{cutoff_val}_vs_0-{neg_max}"
+    feature_set_label = 'clinical+radiomics' if args.feature_set == 'both' else 'radiomics'
+    # Outputs go to OneDrive (synced/shared); source data (radiomics CSVs, clinical/outcomes
+    # spreadsheets) stays on T7 Shield -- see --features-path/--clinical-data-path/etc. defaults.
+    _base = (f'/Users/Francisco/Library/CloudStorage/OneDrive-TheMountSinaiHospital/'
+             f'Regeneron retrospective radiomics/Results/main_pipeline/immunophenotype/'
+             f'{cutoff_label}/' + feature_set_label)
 
     if args.output_dir is None:
         if args.stage == 'partition':
