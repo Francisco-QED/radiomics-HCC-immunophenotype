@@ -81,14 +81,43 @@ def preselect_sequences(df, allowed_sequences, id_col='PatientID'):
         print("No sequence filter applied. Keeping all features.")
         return df
 
+    # Match on the leading "{sequence}_" prefix segment, not a substring anywhere in the column
+    # name -- a plain `in` check let 'ap' match "...original_shape_..." (since "shape" contains
+    # "ap"), silently leaking every other sequence's shape features into any combo containing 'ap'.
     cols_to_keep = [id_col] if id_col in df.columns else []
     for col in df.columns:
-        if any(seq.lower() in col.lower() for seq in allowed_sequences):
+        if any(col.lower().startswith(seq.lower() + '_') for seq in allowed_sequences):
             cols_to_keep.append(col)
 
     filtered_df = df[cols_to_keep]
     print(f"Preselection complete. Kept sequences: {allowed_sequences}")
     print(f"Features reduced from {df.shape[1]} to {filtered_df.shape[1]}")
+    return filtered_df
+
+
+
+def filter_feature_families(df, exclude_families=None, id_col='PatientID'):
+    """Drop PyRadiomics filter families (e.g. wavelet) from the feature matrix.
+
+    PyRadiomics feature names spell out their filter family explicitly (e.g.
+    'pre_wavelet-LLL_glcm_Autocorrelation'), so a plain substring match is enough -- no other
+    sequence, feature class, or feature name in this dataset contains 'wavelet' as a substring.
+    Wavelet is excluded by default (see --exclude-feature-families): it accounts for ~61% of
+    extracted columns and is the filter family most consistently flagged in the radiomics
+    reproducibility literature as sensitive to acquisition/reconstruction variability, without a
+    matching gain in candidate signal (most of its 8 subbands are highly correlated
+    re-expressions of the same texture).
+    """
+    if not exclude_families:
+        return df
+
+    cols_to_keep = [
+        col for col in df.columns
+        if col == id_col or not any(fam.lower() in col.lower() for fam in exclude_families)
+    ]
+    filtered_df = df[cols_to_keep]
+    print(f"Filtered out feature families {exclude_families}. "
+          f"Features reduced from {df.shape[1]} to {filtered_df.shape[1]}")
     return filtered_df
 
 
@@ -181,10 +210,28 @@ def partition_with_constraints(df_filtered, outcomes_path, icc_path, clinical_da
                                 cutoff, test_size, output_dir, random_state=PARTITION_SEED,
                                 clinical_output_dir=None):
     df_outcomes = pd.read_excel(outcomes_path)
+    # NaN >= cutoff evaluates to False in pandas, which .astype(int) would silently turn into a
+    # confirmed "0" (low) label -- patients with unscorable label_col (e.g. "No tumor in slide",
+    # so TILs_resection was never assessed) would be miscoded as genuine negatives rather than
+    # excluded. Drop them before computing y_bin, matching what compare_dev_test() already does
+    # independently for its own descriptive table (that filter never touched X_dev/y_dev/X_lock/
+    # y_lock, which are finalized here, before compare_dev_test ever runs).
+    n_before = len(df_outcomes)
+    df_outcomes = df_outcomes[df_outcomes[label_col].notna()].copy()
+    if len(df_outcomes) < n_before:
+        print(f"Dropped {n_before - len(df_outcomes)} patients with missing '{label_col}' "
+              f"before computing y_bin (would otherwise be miscoded as class 0).")
     df_outcomes['y_bin'] = (df_outcomes[label_col] >= cutoff).astype(int)
     df_icc = pd.read_csv(icc_path)
 
     df_merged = df_filtered.reset_index().merge(df_outcomes[['PatientID', 'y_bin']], on='PatientID', how='inner').set_index('PatientID')
+
+    # Sort by PatientID before any split: train_test_split's shuffling depends on row order even
+    # under a fixed random_state, so without this, which patients land in dev vs lock would depend
+    # on incidental row order in whichever features CSV was loaded -- not just on patient identity
+    # + seed. Sorting pins the split to patient identity alone (see recurrence_pipeline.py's
+    # partition_with_constraints_survival for the concrete failure mode this prevents).
+    df_merged = df_merged.sort_index()
 
     icc_ids = df_icc['PatientID'].unique()
     # Dev-Must: Patients with double ROIs (inter-reader cases must be in the development set)
@@ -1243,6 +1290,10 @@ def train_multiple_models(in_dir, param_dir, out_dir, model_list=None, n_bootstr
 
     comparison_df = pd.DataFrame(formatted_results)
     create_roc_comparison_plot(results_list, out_dir)
+    # svm_linear consistently underperforms the rest of the roster (Section 7 reports/presentation
+    # material) -- a second plot with it excluded avoids one bad curve compressing the others.
+    results_no_svm_linear = [r for r in results_list if r.get('model_name') != 'svm_linear']
+    create_roc_comparison_plot(results_no_svm_linear, out_dir, filename='model_roc_comparison_no_svm_linear.png')
 
     print(f"\n{'='*100}")
     print(f"MODEL COMPARISON SUMMARY (threshold={threshold}, with 95% Bootstrap Confidence Intervals)")
@@ -1278,6 +1329,7 @@ def run_partition_stage(args):
 
     df_all_seq = pd.read_csv(args.features_path, index_col=0)
     df_filtered = preselect_sequences(df_all_seq, allowed_sequences=args.sequences)
+    df_filtered = filter_feature_families(df_filtered, exclude_families=args.exclude_feature_families)
 
     if args.feature_set == 'both':
         # Joined AFTER sequence preselection: preselect_sequences keeps any column whose name
@@ -1330,6 +1382,15 @@ def run_partition_stage(args):
         (fold_coefficients['Selection_Frequency'] >= args.min_fold_n) & fold_coefficients['Sign_Stable']
     ]
     consensus_features = frequent_features.head(args.target_feature_count).index.tolist()
+
+    if len(consensus_features) == 0:
+        raise RuntimeError(
+            f"No consensus features survived selection: 0 features were selected by LASSO in "
+            f">= --min-fold-n={args.min_fold_n} of the 5 outer folds with a stable coefficient sign. "
+            f"Each fold's own LASSO selection was non-empty (see lasso_coeffs_fold.csv), they just "
+            f"didn't overlap enough across folds -- a fold-to-fold selection instability symptom, "
+            f"not a data error. Loosen --min-fold-n and/or re-run."
+        )
 
     # Honest, dev-only nested CV estimate: how well does the whole selection+fit pipeline
     # generalize, pooled across all of X_dev rather than the much smaller lock set. Never touches
@@ -1419,6 +1480,10 @@ def parse_arguments():
 
     # --- partition stage ---
     parser.add_argument('--sequences', nargs='+', default=['pvp', 'tp', 'hbp', 'dwi_b1', 'adc'])
+    parser.add_argument('--exclude-feature-families', nargs='*', default=['wavelet'],
+        help="PyRadiomics filter families to drop before feature selection (prefix match on "
+             "the '{sequence}_{family}_...' column segment, e.g. 'wavelet' drops all 8 "
+             "wavelet-* subbands). Pass --exclude-feature-families with no values to keep all.")
     parser.add_argument('--features-path', type=str,
         default='/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/SA1_2/R-SA1_2_I-sitkBSpline_S-1mm_W-perseq.csv')
     parser.add_argument('--path-r1', type=str,

@@ -79,13 +79,42 @@ def preselect_sequences(df, allowed_sequences, id_col='PatientID'):
     if not allowed_sequences:
         print("No sequence filter applied. Keeping all features.")
         return df
+    # Match on the leading "{sequence}_" prefix segment, not a substring anywhere in the column
+    # name -- a plain `in` check let 'ap' match "...original_shape_..." (since "shape" contains
+    # "ap"), silently leaking every other sequence's shape features into any combo containing 'ap'.
     cols = [id_col] if id_col in df.columns else []
     for col in df.columns:
-        if any(seq.lower() in col.lower() for seq in allowed_sequences):
+        if any(col.lower().startswith(seq.lower() + '_') for seq in allowed_sequences):
             cols.append(col)
     filtered = df[cols]
     print(f"Preselection: {df.shape[1]} → {filtered.shape[1]} features ({allowed_sequences})")
     return filtered
+
+
+
+def filter_feature_families(df, exclude_families=None, id_col='PatientID'):
+    """Drop PyRadiomics filter families (e.g. wavelet) from the feature matrix.
+
+    PyRadiomics feature names spell out their filter family explicitly (e.g.
+    'pre_wavelet-LLL_glcm_Autocorrelation'), so a plain substring match is enough -- no other
+    sequence, feature class, or feature name in this dataset contains 'wavelet' as a substring.
+    Wavelet is excluded by default (see --exclude-feature-families): it accounts for ~61% of
+    extracted columns and is the filter family most consistently flagged in the radiomics
+    reproducibility literature as sensitive to acquisition/reconstruction variability, without a
+    matching gain in candidate signal (most of its 8 subbands are highly correlated
+    re-expressions of the same texture).
+    """
+    if not exclude_families:
+        return df
+
+    cols_to_keep = [
+        col for col in df.columns
+        if col == id_col or not any(fam.lower() in col.lower() for fam in exclude_families)
+    ]
+    filtered_df = df[cols_to_keep]
+    print(f"Filtered out feature families {exclude_families}. "
+          f"Features reduced from {df.shape[1]} to {filtered_df.shape[1]}")
+    return filtered_df
 
 
 def global_cleanup(df, cv_threshold, id_col='PatientID'):
@@ -167,6 +196,14 @@ def partition_with_constraints_survival(df_filtered, outcomes_path, icc_path,
     df_merged = df_merged.dropna(subset=[event_col, time_col])
     print(f"Dropped {n0 - len(df_merged)} patients with missing survival data.")
 
+    # Sort by PatientID before any split: train_test_split's shuffling depends on row order even
+    # under a fixed random_state, so without this, which patients land in dev vs lock (and hence
+    # in which outer CV fold) would depend on incidental row order in whichever features CSV was
+    # loaded -- not just on patient identity + seed. A single patient added/reordered upstream
+    # (e.g. between binwidth extraction batches) could otherwise silently produce a different,
+    # unreproducible split. Sorting pins the split to patient identity alone.
+    df_merged = df_merged.sort_index()
+
     icc_ids   = df_icc['PatientID'].unique()
     df_must   = df_merged[df_merged.index.isin(icc_ids)]
     df_rest   = df_merged[~df_merged.index.isin(icc_ids)]
@@ -188,23 +225,26 @@ def partition_with_constraints_survival(df_filtered, outcomes_path, icc_path,
         columns={event_col: 'Recurrence', time_col: 'Follow-up time (days)'})
     df_clinical = df_clinical.merge(outcomes_map.reset_index(), on='PatientID', how='left')
     _clin_dir = clinical_output_dir or output_dir
-    df_clinical[df_clinical['PatientID'].isin(X_dev.index)].to_csv(
-        f"{_clin_dir}/clinical_metadata_dev.csv", index=False)
-    df_clinical[df_clinical['PatientID'].isin(X_lock.index)].to_csv(
-        f"{_clin_dir}/clinical_metadata_lock.csv", index=False)
+    df_clinical_dev  = df_clinical[df_clinical['PatientID'].isin(X_dev.index)]
+    df_clinical_lock = df_clinical[df_clinical['PatientID'].isin(X_lock.index)]
+    df_clinical_dev.to_csv(f"{_clin_dir}/clinical_metadata_dev.csv", index=False)
+    df_clinical_lock.to_csv(f"{_clin_dir}/clinical_metadata_lock.csv", index=False)
 
     n_events_dev  = int(y_dev[event_col].sum())
     n_events_lock = int(y_lock[event_col].sum())
     print(f"Dev:  {len(X_dev)}  ({len(df_must)} ICC-constrained, {n_events_dev} events)")
     print(f"Lock: {len(X_lock)} ({n_events_lock} events)")
-    return X_dev, y_dev, X_lock, y_lock
+    return X_dev, y_dev, X_lock, y_lock, df_clinical_dev, df_clinical_lock
 
 
+# Names must match the actual columns in clinical_data_path exactly -- compare_dev_lock_clinical
+# silently skips anything that doesn't match, so a wrong name here just disappears from the report
+# instead of erroring. Verified against the same spreadsheet main_pipeline.py reads (SA1-2_clinical
+# imaging.xlsx) -- see its --compare-variables default and load_clinical_features, main_pipeline.py:145-165.
 CLINICAL_COMPARISON_VARS = [
-    'Age', 'Gender', 'BMI', 'Etiology of liver disease', 'Cirrhosis',
-    'Tumor grade', 'Tumor size (cm)', 'Tumor size on PVP',
-    'Capsule on PVP', 'Mosaic appearance',
-    'Recurrence', 'Follow-up time (days)',
+    'Age', 'Gender', 'Cirrhosis', 'Capsule (on PVP yes/no)', 'Mosaic appearance (yes/no)',
+    'Macrovascular invasion (yes/no)', 'Maximum tumor size on T1 portal venous phase (PVP)',
+    'Serum AFP', 'Recurrence', 'Follow-up time (days)',
 ]
 
 
@@ -351,6 +391,23 @@ def spearman_filter(df, threshold, tie_breaker_series):
     return df.drop(columns=list(to_drop))
 
 
+def _compute_alpha_max(X, y_struct, l1_ratio=1.0):
+    """Data-derived upper end of the Cox-LASSO regularization path for this fold.
+
+    A universal, hardcoded alpha range (the old np.logspace(-4, 1, 20)) can sit entirely above
+    the range where this fold's data actually has any nonzero-coefficient solutions -- confirmed
+    by comparing against CoxnetSurvivalAnalysis's own auto-generated path, which found real signal
+    (deviance_ratio up to 0.28) in a range (~0.00007-0.2) that the old fixed grid never reached.
+    Probing alpha_max fresh per outer fold (via the library's own path-generation, capped at a
+    generous n_alphas so it fully traverses down to near-zero coefficients) keeps the grid anchored
+    to this fold's actual data scale instead of a magic-number range copied from a different loss
+    function's convention.
+    """
+    probe = CoxnetSurvivalAnalysis(l1_ratio=l1_ratio, max_iter=100000, n_alphas=100)
+    probe.fit(X, y_struct)
+    return float(probe.alphas_.max())
+
+
 def _select_lasso_cox_alpha(X, y_struct, alphas, n_inner=3, random_state=RANDOM_STATE):
     """Inner CV: fit full regularisation path once per fold (warm starts), pick best alpha."""
     alphas_desc = np.sort(alphas)[::-1].tolist()
@@ -360,7 +417,7 @@ def _select_lasso_cox_alpha(X, y_struct, alphas, n_inner=3, random_state=RANDOM_
 
     for tr_idx, va_idx in kf.split(X):
         try:
-            m = CoxnetSurvivalAnalysis(alphas=alphas_desc, l1_ratio=1.0, max_iter=1000)
+            m = CoxnetSurvivalAnalysis(alphas=alphas_desc, l1_ratio=1.0, max_iter=100000)
             m.fit(X.iloc[tr_idx], y_struct[tr_idx])
             for i, alpha in enumerate(alphas_desc):
                 try:
@@ -425,11 +482,41 @@ def run_fold_pruning_survival(X_tr, y_tr_struct, target_count,
     X_sp = spearman_filter(X_filt, threshold=0.85, tie_breaker_series=kept['p_value'])
     print(f"  Spearman: {n0} → {X_sp.shape[1]} features.")
 
-    alphas = np.logspace(-4, 1, 20)
+    # Grid anchored to this fold's own data (see _compute_alpha_max) instead of a fixed absolute
+    # range -- same 5-order-of-magnitude span and point count as the original design, just scaled
+    # to where this fold's path actually has signal. alpha_max is computed once on the full outer-
+    # fold training data (X_sp) and reused for every inner-CV sub-fold's fit below, so all three
+    # inner folds are still scored against the same candidate alpha values (required for the
+    # per-alpha score averaging in _select_lasso_cox_alpha to be valid).
+    alpha_max = _compute_alpha_max(X_sp, y_tr_struct)
+    alphas = np.logspace(np.log10(alpha_max) - 5, np.log10(alpha_max), 20)
     best_alpha = _select_lasso_cox_alpha(X_sp, y_tr_struct, alphas, random_state=random_state)
 
-    lasso = CoxnetSurvivalAnalysis(alphas=[best_alpha], l1_ratio=1.0, max_iter=1000)
-    lasso.fit(X_sp, y_tr_struct)
+    # The inner-CV score for best_alpha comes from smaller sub-fold fits; occasionally the same
+    # alpha is too weakly regularized for the full (larger) outer-fold training set and the native
+    # solver diverges ("weights are too large"). Step up to the next larger (safer) grid alpha
+    # rather than letting the whole combo crash -- this is the same class of fallback as the
+    # existing all-zero-coefficients handling below, just for the opposite failure mode.
+    candidates = sorted([a for a in alphas if a >= best_alpha])
+    lasso = None
+    fallback_steps = 0
+    for candidate_alpha in candidates:
+        try:
+            lasso = CoxnetSurvivalAnalysis(alphas=[candidate_alpha], l1_ratio=1.0, max_iter=100000)
+            lasso.fit(X_sp, y_tr_struct)
+            if candidate_alpha != best_alpha:
+                print(f"  alpha={best_alpha:.5f} diverged on the full fold; "
+                      f"stepped up to alpha={candidate_alpha:.5f}.")
+            best_alpha = candidate_alpha
+            break
+        except ArithmeticError:
+            fallback_steps += 1
+            continue
+    if lasso is None:
+        raise RuntimeError(
+            f"LASSO-Cox diverged at every candidate alpha from {best_alpha:.5f} up to "
+            f"alpha_max={alpha_max:.5f}. Data for this fold may be numerically degenerate."
+        )
 
     coefs = pd.Series(lasso.coef_[:, 0], index=X_sp.columns)
     nonzero = coefs[coefs != 0]
@@ -441,9 +528,15 @@ def run_fold_pruning_survival(X_tr, y_tr_struct, target_count,
 
     selected = nonzero.abs().nlargest(target_count)
     selected = nonzero.loc[selected.index]  # preserve sign
-    print(f"  LASSO-Cox (alpha={best_alpha:.5f}): selected {len(selected)} features.")
+    print(f"  LASSO-Cox (alpha={best_alpha:.5f}, alpha_max={alpha_max:.5f}): selected {len(selected)} features.")
 
-    return selected, imputer, scaler, X_sp.columns, lasso, scorecard
+    alpha_diag = {
+        'alpha_max': alpha_max, 'best_alpha': best_alpha,
+        'alpha_max_ratio': best_alpha / alpha_max if alpha_max > 0 else np.nan,
+        'n_features_at_lasso': X_sp.shape[1], 'n_nonzero_selected': len(nonzero),
+        'divergence_fallback_steps': fallback_steps,
+    }
+    return selected, imputer, scaler, X_sp.columns, lasso, scorecard, alpha_diag
 
 
 # ================================================================================
@@ -458,6 +551,7 @@ def run_cross_validation_survival(X, y_dev_df, event_col, time_col, target_count
     fold_coefficients = pd.DataFrame(0.0, index=X.columns,
                                       columns=[f'Fold_{i+1}' for i in range(5)])
     oof_risk = pd.Series(np.nan, index=X.index, name='risk_score')
+    alpha_diagnostics = []
 
     for fold, (tr_idx, va_idx) in enumerate(skf.split(X, events)):
         X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
@@ -466,10 +560,11 @@ def run_cross_validation_survival(X, y_dev_df, event_col, time_col, target_count
 
         y_tr_struct = make_survival_array(y_tr_df[event_col], y_tr_df[time_col])
 
-        selected_coefs, imputer, scaler, spearman_feats, lasso, scorecard = run_fold_pruning_survival(
+        selected_coefs, imputer, scaler, spearman_feats, lasso, scorecard, alpha_diag = run_fold_pruning_survival(
             X_tr, y_tr_struct, target_count,
             hr_cutoff=hr_cutoff, q_cutoff=q_cutoff, random_state=random_state
         )
+        alpha_diagnostics.append({'Fold': fold + 1, **alpha_diag})
 
         fold_coefficients.loc[selected_coefs.index, f'Fold_{fold+1}'] = selected_coefs.values
 
@@ -511,7 +606,9 @@ def run_cross_validation_survival(X, y_dev_df, event_col, time_col, target_count
     y_struct_all = make_survival_array(y_dev_df[event_col], y_dev_df[time_col])
     global_scorecard = calculate_survival_feature_metrics(X_sc, y_struct_all)
 
-    return fold_coefficients, global_scorecard, oof_risk
+    alpha_diagnostics = pd.DataFrame(alpha_diagnostics).set_index('Fold')
+
+    return fold_coefficients, global_scorecard, oof_risk, alpha_diagnostics
 
 
 def summarize_nested_cv_survival(oof_risk, y_dev_df, event_col, time_col,
@@ -639,6 +736,16 @@ def plot_km_by_risk(risk_scores, y_struct, out_dir, model_name, event_col_label=
     time   = y_struct['Time']
     status = y_struct['Status']
 
+    # A degenerate model (e.g. LASSO-Cox regularized to all-zero coefficients) predicts an
+    # identical risk score for every patient. Nothing is then strictly greater than the median,
+    # so the "high risk" group is empty -- lifelines' KaplanMeierFitter raises on an empty group,
+    # which would otherwise propagate up and discard an already-computed C-index/AUC result for
+    # a reason unrelated to those metrics. Skip the plot/logrank test in that case instead.
+    if high.sum() == 0 or low.sum() == 0:
+        print(f"  Skipping KM plot/log-rank test for {model_name}: risk scores have no spread "
+              f"(median split produced an empty group -- model likely predicts a constant risk).")
+        return None, float('nan')
+
     lr = logrank_test(time[high], time[low], event_observed_A=status[high], event_observed_B=status[low])
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -656,7 +763,13 @@ def plot_km_by_risk(risk_scores, y_struct, out_dir, model_name, event_col_label=
     plt.savefig(path, dpi=300)
     plt.close(fig)
     print(f"  KM plot saved: {path}")
-    return path
+    # Logrank p-value is returned (not just plotted) so callers can screen out models whose
+    # median-risk-score split doesn't produce a real separation -- the survival analog of
+    # excluding a degenerate classifier: C-index alone can't catch this the way AUC can hide a
+    # degenerate sensitivity/specificity operating point, since C-index IS the ranking metric,
+    # but a model can still have a mediocre-but-nonzero C-index with a KM split that isn't
+    # actually significant, which this catches.
+    return path, float(lr.p_value)
 
 
 def plot_td_auc_curve(auc_dfs, model_names, out_dir):
@@ -699,10 +812,31 @@ def train_and_evaluate_survival_model(X_dev, y_dev_df, X_lock, y_lock_df,
     try:
         model_source = 'default'
         if model_name == 'lasso_cox':
-            alphas = np.logspace(-4, 1, 20)
+            # Same data-derived grid as run_fold_pruning_survival's per-fold selection -- see
+            # _compute_alpha_max's docstring for why a fixed absolute range doesn't work here.
+            alpha_max = _compute_alpha_max(X_dev, y_dev_struct)
+            alphas = np.logspace(np.log10(alpha_max) - 5, np.log10(alpha_max), 20)
             best_alpha = _select_lasso_cox_alpha(X_dev, y_dev_struct, alphas, random_state=random_state)
-            model = CoxnetSurvivalAnalysis(alphas=[best_alpha], l1_ratio=1.0, max_iter=1000)
-            model.fit(X_dev, y_dev_struct)
+            # Same divergence fallback as run_fold_pruning_survival: the inner-CV-selected alpha
+            # can be too weakly regularized for the full dev set even when it worked on smaller
+            # inner sub-folds. Step up to the next larger (safer) grid alpha rather than losing
+            # this model entirely to the outer except below.
+            model = None
+            for candidate_alpha in sorted(a for a in alphas if a >= best_alpha):
+                try:
+                    model = CoxnetSurvivalAnalysis(alphas=[candidate_alpha], l1_ratio=1.0, max_iter=100000)
+                    model.fit(X_dev, y_dev_struct)
+                    if candidate_alpha != best_alpha:
+                        print(f"  alpha={best_alpha:.5f} diverged on the full dev set; "
+                              f"stepped up to alpha={candidate_alpha:.5f}.")
+                    best_alpha = candidate_alpha
+                    break
+                except ArithmeticError:
+                    continue
+            if model is None:
+                raise RuntimeError(
+                    f"LASSO-Cox diverged at every candidate alpha up to alpha_max={alpha_max:.5f}."
+                )
             model_source = f'inner_cv (alpha={best_alpha:.5f})'
             print(f"  LASSO-Cox alpha (inner CV): {best_alpha:.5f}")
             coefs = pd.Series(model.coef_[:, 0], index=X_dev.columns)
@@ -729,7 +863,8 @@ def train_and_evaluate_survival_model(X_dev, y_dev_df, X_lock, y_lock_df,
         for _, row in td_auc_df.iterrows():
             print(f"    {row['label']}: {row['AUC']:.3f}")
 
-        km_path = plot_km_by_risk(risk_lock, y_lock_struct, out_dir, model_name)
+        km_path, logrank_p = plot_km_by_risk(risk_lock, y_lock_struct, out_dir, model_name)
+        print(f"  Log-rank p (high vs. low risk, median split): {logrank_p:.4f}")
 
         with open(os.path.join(out_dir, f'{model_name}_model.pkl'), 'wb') as f:
             pickle.dump(model, f)
@@ -741,6 +876,7 @@ def train_and_evaluate_survival_model(X_dev, y_dev_df, X_lock, y_lock_df,
             'c_index': ci_result['c_index'],
             'ci_lower': ci_result['ci_lower'],
             'ci_upper': ci_result['ci_upper'],
+            'logrank_p': logrank_p,
             'td_auc': td_auc_df,
             'risk_lock': risk_lock,
             'status': 'success',
@@ -828,14 +964,20 @@ def load_preprocessed_survival(in_dir):
 
 def run_partition_stage(args):
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    # Three levels up from binwidth_perseq/{seq_tag}/partition_select/ → recurrence_survival/
-    _recurrence_dir = str(Path(args.output_dir).parents[2])
+    # Prefer the explicit --clinical-output-dir (what recurrence_sweep.py always passes, pointed
+    # at the per-binwidth summary_results/ folder) over walking up from --output-dir by directory
+    # count -- that count has already silently broken twice from directory-structure changes: once
+    # when the radiomics/ path segment was added, and again when combos moved under a combinations/
+    # subfolder. Fallback (direct manual invocations without --clinical-output-dir): five levels up
+    # from radiomics/binwidth_perseq/combinations/{seq_tag}/partition_select/ -> recurrence_survival/.
+    _recurrence_dir = args.clinical_output_dir or str(Path(args.output_dir).parents[4])
     Path(_recurrence_dir).mkdir(parents=True, exist_ok=True)
 
     df_all = pd.read_csv(args.features_path, index_col=0)
     df_filtered = preselect_sequences(df_all, allowed_sequences=args.sequences)
+    df_filtered = filter_feature_families(df_filtered, exclude_families=args.exclude_feature_families)
 
-    X_dev, y_dev, X_lock, y_lock = partition_with_constraints_survival(
+    X_dev, y_dev, X_lock, y_lock, df_clinical_dev, df_clinical_lock = partition_with_constraints_survival(
         df_filtered,
         outcomes_path=args.outcomes_path,
         icc_path=args.icc_path,
@@ -848,6 +990,7 @@ def run_partition_stage(args):
     )
 
     compare_dev_lock_survival(y_dev, y_lock, args.event_col, args.time_col, _recurrence_dir)
+    compare_dev_lock_clinical(df_clinical_dev, df_clinical_lock, CLINICAL_COMPARISON_VARS, _recurrence_dir)
 
     X_dev_clean     = global_cleanup(X_dev, cv_threshold=args.cv_threshold)
     X_dev_clean_icc = interobserver_stability(X_dev_clean, args.path_r1, args.path_r2,
@@ -857,7 +1000,7 @@ def run_partition_stage(args):
     print(f"\nAfter cleanup + ICC: {X_dev_clean_icc.shape[0]} samples, "
           f"{X_dev_clean_icc.shape[1]} features")
 
-    fold_coefficients, global_scorecard, oof_risk = run_cross_validation_survival(
+    fold_coefficients, global_scorecard, oof_risk, alpha_diagnostics = run_cross_validation_survival(
         X_dev_clean_icc, y_dev_filtered,
         event_col=args.event_col, time_col=args.time_col,
         target_count=args.lasso_target_count,
@@ -874,6 +1017,15 @@ def run_partition_stage(args):
     fold_coefficients.to_csv(f"{args.output_dir}/lasso_coeffs_fold.csv")
     global_scorecard.to_csv(f"{args.output_dir}/univariate_cox_metrics.csv")
     pd.DataFrame([nested_cv_result]).to_csv(f"{args.output_dir}/nested_cv_diagnostics.csv", index=False)
+    alpha_diagnostics.to_csv(f"{args.output_dir}/alpha_diagnostics.csv")
+    # Flag any fold whose chosen alpha landed within 1% of alpha_max (the data-derived ceiling) --
+    # a recurring pileup there would mean the grid's span (5 orders of magnitude below alpha_max)
+    # is still too narrow for this combo, the same failure mode as the old fixed [1e-4, 10] grid.
+    at_ceiling = alpha_diagnostics['alpha_max_ratio'] >= 0.99
+    if at_ceiling.any():
+        print(f"  NOTE: {at_ceiling.sum()}/5 folds selected alpha within 1% of alpha_max "
+              f"(folds {alpha_diagnostics.index[at_ceiling].tolist()}) -- consider widening the "
+              "grid's span below alpha_max if this recurs across many combos.")
 
     frequent = fold_coefficients[
         (fold_coefficients['Selection_Frequency'] >= args.min_fold_n) &
@@ -969,7 +1121,8 @@ def run_train_stage(args):
             row = {'Model': r['model_name'],
                    'Source': r.get('model_source', ''),
                    'C-index': f"{r['c_index']:.3f}",
-                   '95% CI': f"({r['ci_lower']:.3f} – {r['ci_upper']:.3f})"}
+                   '95% CI': f"({r['ci_lower']:.3f} – {r['ci_upper']:.3f})",
+                   'Logrank p': f"{r['logrank_p']:.4f}"}
             for _, td_row in r['td_auc'].iterrows():
                 row[f"AUC {td_row['label']}"] = f"{td_row['AUC']:.3f}" if not np.isnan(td_row['AUC']) else 'N/A'
             rows.append(row)
@@ -1021,20 +1174,32 @@ def parse_arguments():
 
     # --- sequence selection ---
     parser.add_argument('--sequences', nargs='+', default=['pvp', 'tp', 'hbp', 'dwi_b1', 'adc'])
+    parser.add_argument('--exclude-feature-families', nargs='*', default=['wavelet'],
+        help="PyRadiomics filter families to drop before feature selection (prefix match on "
+             "the '{sequence}_{family}_...' column segment, e.g. 'wavelet' drops all 8 "
+             "wavelet-* subbands). Pass --exclude-feature-families with no values to keep all.")
 
     # --- partition stage ---
+    parser.add_argument('--clinical-output-dir', type=str, default=None,
+        help="Where clinical_metadata_dev/lock.csv and dev_lock_survival_summary.csv get "
+             "written. Defaults to walking up from --output-dir if not given. Sweeps over "
+             "sequence combos should point this at one shared per-binwidth location, since the "
+             "dev/lock split doesn't depend on which sequences are used (mirrors "
+             "main_pipeline.py's --clinical-output-dir).")
     parser.add_argument('--test-size', type=int, default=30)
     parser.add_argument('--cv-threshold', type=float, default=0.1)
     parser.add_argument('--icc-threshold', type=float, default=0.85)
     parser.add_argument('--lasso-target-count', type=int, default=100)
     parser.add_argument('--hr-cutoff', type=float, default=1.5,
         help="Hazard ratio threshold for effect-size screen: keep |log(HR)| > log(hr_cutoff).")
-    parser.add_argument('--q-cutoff', type=float, default=0.50,
+    parser.add_argument('--q-cutoff', type=float, default=0.20,
         help="FDR q-value threshold (Benjamini-Hochberg) within the HR-screened pool.")
     parser.add_argument('--min-fold-n', type=int, default=3,
         help="Minimum number of folds a feature must appear in for consensus.")
-    parser.add_argument('--target-feature-count', type=int, default=15,
-        help="Number of consensus features to carry into the final model.")
+    parser.add_argument('--target-feature-count', type=int, default=10,
+        help="Number of consensus features to carry into the final model. Matches the "
+             "classification pipeline's default -- no observed combo has come close to either "
+             "cap, so this is a consistency choice, not a response to a binding constraint.")
 
     # --- gridsearch stage ---
     parser.add_argument('--cv', type=int, default=5)
@@ -1046,6 +1211,10 @@ def parse_arguments():
         help="(Reserved) Generate SHAP plots (not yet implemented for survival models).")
 
     # --- I/O ---
+    parser.add_argument('--binwidth-label', type=str, default='binwidth_perseq',
+        help="Output folder name under recurrence_survival/ (default: binwidth_perseq). Pass "
+             "a different label (e.g. binwidth5) together with --features-path pointing at a "
+             "different binwidth's extraction to run that setting instead.")
     parser.add_argument('--output-dir', type=str, default=None)
     parser.add_argument('--input-dir', type=str, default=None,
         help="Input dir for the current stage (gridsearch reads partition artifacts; "
@@ -1060,7 +1229,7 @@ def parse_arguments():
         args.icc_path = args.path_r1
 
     seq_tag = "_".join(args.sequences)
-    _local_results = str(Path.home() / "Library" / "CloudStorage" / "OneDrive-TheMountSinaiHospital" / "Regeneron retrospective radiomics" / "Results" / "main_pipeline" / "recurrence_survival" / "binwidth_perseq")
+    _local_results = str(Path.home() / "Library" / "CloudStorage" / "OneDrive-TheMountSinaiHospital" / "Regeneron retrospective radiomics" / "Results" / "main_pipeline" / "recurrence_survival" / "radiomics" / args.binwidth_label / "combinations")
     _base_out = f"{_local_results}/{seq_tag}"
     _partition_dir  = f"{_base_out}/partition_select"
     _gridsearch_dir = f"{_base_out}/optimized_params"

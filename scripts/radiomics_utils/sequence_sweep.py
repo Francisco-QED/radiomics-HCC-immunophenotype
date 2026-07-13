@@ -10,9 +10,16 @@
 #   - t2 optional, included only when it doesn't push the total above MAX_TOTAL_SEQS.
 #   - Total sequence count capped at MAX_TOTAL_SEQS (5), matching the original baseline's size.
 #
-# Usage:
-#   caffeinate -i python3 sequence_sweep.py
-#   python3 sequence_sweep.py --dry-run   # just print the combinations, don't execute anything
+# Usage (run once per TILs cutoff -- the sweep no longer loops over cutoffs internally, so its
+# sweep_results.csv lands in that cutoff's own <binwidth-label>/summary_results/ folder):
+#   caffeinate -i python3 sequence_sweep.py --cutoff 2
+#   caffeinate -i python3 sequence_sweep.py --cutoff 3
+#   python3 sequence_sweep.py --cutoff 2 --dry-run   # just print the combinations, don't execute
+#
+# --binwidth-label/--features-path target a different binwidth setting (e.g. the fixed binWidth=5
+# extraction instead of the default per-sequence one) without editing this file:
+#   python3 sequence_sweep.py --cutoff 2 --binwidth-label binwidth5 \
+#       --features-path "/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Results/Radiomics_sheets/SA1_2/R-SA1_2_I-sitkBSpline_S-1mm_W-5.csv"
 
 import argparse
 import itertools
@@ -28,7 +35,7 @@ PIPELINE = str(Path(__file__).resolve().parent / "main_pipeline.py")
 
 CONTRAST_SEQS = ["ap", "pvp", "tp", "hbp"]
 DIFFUSION_OPTIONS = [["dwi_b1", "adc"], ["dwi_b2", "adc"]]
-CUTOFFS = [2, 3]
+CUTOFFS = [2, 3]  # valid --cutoff choices; the sweep runs one cutoff per invocation
 MIN_CONTRAST = 2
 MAX_TOTAL_SEQS = 5
 
@@ -38,27 +45,31 @@ _RESULTS_DIR = (Path.home() / "Library" / "CloudStorage"
                 / "Results" / "main_pipeline" / "immunophenotype")
 
 LOG_DIR = Path(__file__).resolve().parent / "sweep_logs"
-RESULTS_CSV = _RESULTS_DIR / "sweep_results.csv"
+
+# Default binwidth setting -- matches main_pipeline.py's own --features-path default (the
+# per-sequence-binwidth extraction). Passing --binwidth-label/--features-path targets any other
+# binwidth extraction (e.g. the fixed binWidth=5 sheet) without editing this file.
+DEFAULT_BINWIDTH_LABEL = "binwidth_perseq"
 
 
 # main_pipeline.py's own default --output-dir no longer has a per-sequence-combo segment (it
 # routes single fixed-sequence runs to .../radiomics or .../clinical+radiomics), so the sweep must
 # pass --output-dir explicitly per combo or every combo would collide into the same folder.
-def combo_base_dir(cutoff, sequences):
+def combo_base_dir(cutoff, sequences, binwidth_label=DEFAULT_BINWIDTH_LABEL):
     cutoff_val = int(cutoff)
     neg_max = cutoff_val - 1
     cutoff_label = f"tils_{cutoff_val}_vs_0-{neg_max}"
-    return _RESULTS_DIR / cutoff_label / "radiomics" / "binwidth_perseq" / "combinations" / "_".join(sequences)
+    return _RESULTS_DIR / cutoff_label / "radiomics" / binwidth_label / "combinations" / "_".join(sequences)
 
 
 # Shared per-cutoff location for artifacts that don't depend on which sequences are used (dev/lock
 # split, clinical_metadata_dev/lock.csv, dev_test_comparison.xlsx) -- computed once per cutoff
-# instead of duplicated into every combo's own folder. Sibling of "combinations/" under binwidth_perseq.
-def summary_results_dir(cutoff):
+# instead of duplicated into every combo's own folder. Sibling of "combinations/" under binwidth_label.
+def summary_results_dir(cutoff, binwidth_label=DEFAULT_BINWIDTH_LABEL):
     cutoff_val = int(cutoff)
     neg_max = cutoff_val - 1
     cutoff_label = f"tils_{cutoff_val}_vs_0-{neg_max}"
-    return _RESULTS_DIR / cutoff_label / "radiomics" / "binwidth_perseq" / "summary_results"
+    return _RESULTS_DIR / cutoff_label / "radiomics" / binwidth_label / "summary_results"
 
 
 def generate_sequence_sets():
@@ -83,11 +94,21 @@ def generate_sequence_sets():
     return unique
 
 
-def run_one(cutoff, sequences):
-    output_dir = combo_base_dir(cutoff, sequences) / "clean_partition_select"
+def run_one(cutoff, sequences, binwidth_label=DEFAULT_BINWIDTH_LABEL, features_path=None, path_r1=None, path_r2=None):
+    output_dir = combo_base_dir(cutoff, sequences, binwidth_label) / "clean_partition_select"
     cmd = [PYTHON, PIPELINE, "--stage", "partition", "--cutoff", str(cutoff), "--sequences"] + sequences \
-        + ["--output-dir", str(output_dir), "--clinical-output-dir", str(summary_results_dir(cutoff))]
-    label = f"cutoff{cutoff}_{'_'.join(sequences)}"
+        + ["--output-dir", str(output_dir), "--clinical-output-dir", str(summary_results_dir(cutoff, binwidth_label))]
+    if features_path:
+        cmd += ["--features-path", str(features_path)]
+    # main_pipeline.py's --path-r1/--path-r2 (reader-comparison files for the ICC stability filter)
+    # default to the binwidth_perseq inter-reader sheets regardless of --features-path -- must be
+    # overridden explicitly here too, or interobserver_stability() filters this binwidth's primary
+    # features using binwidth_perseq's reader1-vs-reader2 reproducibility instead of this binwidth's.
+    if path_r1:
+        cmd += ["--path-r1", str(path_r1)]
+    if path_r2:
+        cmd += ["--path-r2", str(path_r2)]
+    label = f"{binwidth_label}_cutoff{cutoff}_{'_'.join(sequences)}"
     log_path = LOG_DIR / f"{label}.log"
 
     start = time.time()
@@ -132,43 +153,88 @@ def run_one(cutoff, sequences):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--cutoff", type=int, required=True, choices=CUTOFFS,
+                        help="TILs cutoff to sweep. Run once per cutoff.")
+    parser.add_argument("--binwidth-label", type=str, default=DEFAULT_BINWIDTH_LABEL,
+                        help="Output folder name under radiomics/ (default: binwidth_perseq).")
+    parser.add_argument("--features-path", type=str, default=None,
+                        help="Radiomics features CSV to pass to main_pipeline.py --features-path. "
+                             "Defaults to main_pipeline.py's own default (the per-sequence-binwidth "
+                             "extraction) when omitted.")
+    parser.add_argument("--path-r1", type=str, default=None,
+                        help="Reader-1 comparison CSV for the ICC stability filter, matching "
+                             "--features-path's binwidth. Defaults to main_pipeline.py's own default "
+                             "(the binwidth_perseq reader sheet) when omitted -- must be set "
+                             "explicitly for any non-perseq --features-path.")
+    parser.add_argument("--path-r2", type=str, default=None,
+                        help="Reader-2 comparison CSV for the ICC stability filter; see --path-r1.")
     parser.add_argument("--dry-run", action="store_true", help="Print combinations and exit.")
     args = parser.parse_args()
+    cutoff = args.cutoff
+    binwidth_label = args.binwidth_label
+    features_path = args.features_path
+    path_r1 = args.path_r1
+    path_r2 = args.path_r2
 
     sequence_sets = generate_sequence_sets()
-    total_runs = len(sequence_sets) * len(CUTOFFS)
-    print(f"Generated {len(sequence_sets)} sequence sets x {len(CUTOFFS)} cutoffs = {total_runs} runs.")
+    total_runs = len(sequence_sets)
+    print(f"Generated {len(sequence_sets)} sequence sets for cutoff {cutoff} = {total_runs} runs.")
     for s in sequence_sets:
         print(f"  {s}")
 
     if args.dry_run:
         return
 
+    # Per-cutoff output: sits next to this cutoff's own combinations, not at the shared root.
+    results_csv = summary_results_dir(cutoff, binwidth_label) / "sweep_results.csv"
+    results_csv.parent.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
-    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    results = []
-    run_idx = 0
-    for cutoff in CUTOFFS:
-        for sequences in sequence_sets:
-            run_idx += 1
-            print(f"\n[{run_idx}/{total_runs}] cutoff={cutoff} sequences={sequences}", flush=True)
-            row = run_one(cutoff, sequences)
-            print(f"  -> {row['status']} in {row['elapsed_sec']}s"
-                  + (f", best={row.get('best_model')} AUC={row.get('best_oof_auc')}"
-                     if row["status"] == "success" else f", error={row.get('error')}"))
-            results.append(row)
-            # Write incrementally so partial progress survives a crash mid-sweep.
-            pd.DataFrame(results).to_csv(RESULTS_CSV, index=False)
+
+    # Resume support: skip combos already marked success in a previous (interrupted) run of this
+    # same cutoff, so a crash/stop mid-sweep doesn't force redoing everything from combo 1. Mirrors
+    # gridsearch_train_sweep.py's resume logic.
+    done_sequences = set()
+    if results_csv.exists():
+        existing = pd.read_csv(results_csv).drop_duplicates(subset="sequences", keep="last")
+        done_sequences = set(existing.loc[existing["status"] == "success", "sequences"])
+        # Only carry forward rows for combos we're about to SKIP. A combo that will be retried
+        # this run must not keep its old (failed/incomplete) row, or the retry's new row becomes
+        # a duplicate instead of a replacement -- this is exactly how an orphaned prior process
+        # racing this script corrupted cutoff 3's sweep_results.csv (duplicate rows, and combos
+        # silently dropped when the two processes' independently-tracked result lists diverged).
+        results = existing[existing["sequences"].isin(done_sequences)].to_dict("records")
+        print(f"Resuming: {len(done_sequences)} combos already done, skipping them.")
+    else:
+        results = []
+
+    for run_idx, sequences in enumerate(sequence_sets, 1):
+        sequences_str = "_".join(sequences)
+        if sequences_str in done_sequences:
+            print(f"\n[{run_idx}/{total_runs}] cutoff={cutoff} sequences={sequences} -- already done, skipping")
+            continue
+        print(f"\n[{run_idx}/{total_runs}] cutoff={cutoff} sequences={sequences}", flush=True)
+        row = run_one(cutoff, sequences, binwidth_label, features_path, path_r1, path_r2)
+        print(f"  -> {row['status']} in {row['elapsed_sec']}s"
+              + (f", best={row.get('best_model')} AUC={row.get('best_oof_auc')}"
+                 if row["status"] == "success" else f", error={row.get('error')}"))
+        results.append(row)
+        # Write incrementally so partial progress survives a crash mid-sweep.
+        pd.DataFrame(results).to_csv(results_csv, index=False)
 
     df = pd.DataFrame(results)
-    successful = df[df["status"] == "success"].sort_values("best_oof_auc", ascending=False)
+    successful = df[df["status"] == "success"]
     print(f"\n{'='*100}")
-    print(f"SWEEP COMPLETE: {len(successful)}/{total_runs} succeeded")
+    print(f"SWEEP COMPLETE (cutoff {cutoff}): {len(successful)}/{total_runs} succeeded")
     print(f"{'='*100}")
-    print(successful[["cutoff", "sequences", "best_model", "best_oof_auc",
-                       "best_auc_ci_lower", "best_auc_ci_upper", "significant",
-                       "n_consensus_features"]].head(15).to_string(index=False))
-    print(f"\nFull results: {RESULTS_CSV}")
+    if len(successful) == 0:
+        print("No combos succeeded -- nothing to rank.")
+        print(df["status"].value_counts().to_string())
+    else:
+        successful = successful.sort_values("best_oof_auc", ascending=False)
+        print(successful[["cutoff", "sequences", "best_model", "best_oof_auc",
+                           "best_auc_ci_lower", "best_auc_ci_upper", "significant",
+                           "n_consensus_features"]].head(15).to_string(index=False))
+    print(f"\nFull results: {results_csv}")
 
 
 if __name__ == "__main__":

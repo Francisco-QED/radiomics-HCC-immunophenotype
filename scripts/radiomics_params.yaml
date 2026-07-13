@@ -92,7 +92,10 @@ execution:
   interpolators: ['sitkBSpline']
   spacings: [[1, 1, 1]]
   # Use 'perseq' to activate per-sequence bin widths below; use [5] (or any int list) for a uniform sweep.
-  bin_widths: ['perseq']
+  # 20 added for comparison against the per-sequence approach -- a fixed binWidth commonly used in the
+  # radiomics literature. 'perseq' kept in the list too; extraction.py skips any variant whose output
+  # CSV already exists, so this doesn't force re-extraction of the already-complete perseq run.
+  bin_widths: ['perseq', 20]
   per_sequence_bin_widths:
     # 2 x median noise sigma (PyRadiomics-normalized space, normalizeScale=100), rounded to nearest 5.
     # Derived from snr_binwidth.py run on liver patches in Total_segmentations/liver_segs (n=10).
