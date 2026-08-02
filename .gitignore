@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Secrets
+.env
+
 # macOS
 .DS_Store
 
