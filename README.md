@@ -1,7 +1,5 @@
 # radiomics-HCC-immunophenotype
 
-# radiomics-HCC-immunophenotype
-
 Predicting the immune microenvironment (tumor-infiltrating lymphocytes / tertiary
 lymphoid structures) of hepatocellular carcinoma (HCC) from pre-treatment,
 multi-sequence MRI using radiomics and machine learning.
