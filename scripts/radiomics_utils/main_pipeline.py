@@ -36,6 +36,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from scipy.stats import mannwhitneyu, chi2_contingency
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 from sklearn.svm import SVC
 from sklearn.impute import KNNImputer
@@ -469,30 +471,43 @@ def calculate_feature_metrics(X, y):
 # Considers the spearman correlation between features and drops one of each correlated pair.
 # The tie-breaker is the p-value (or AUC/OR) from above, keeping the one with the better score.
 def spearman_filter(df, threshold, tie_breaker_series):
-    corr_matrix = df.corr(method='spearman').abs()
-    to_drop = set()
-    cols = df.columns
+    # Vectorized greedy: process features best-tie-breaker-first, keep a feature unless it's
+    # already too correlated with something already kept (a single numpy comparison against the
+    # kept set, not a per-pair Python loop). This is a behavioral refinement over the original
+    # pairwise-in-column-order loop, not just a speedup: the original's survivor set depended on
+    # incidental column order (a feature only got compared against earlier-indexed columns first),
+    # whereas this always lets the better-tie-breaker feature win regardless of column position --
+    # matters once the candidate pool is in the thousands (wavelet/log-sigma restored) rather than
+    # the ~100s a pure-Python O(n^2) loop was fine for.
+    cols = list(df.columns)
+    corr = df.corr(method='spearman').abs().values
 
-    print("Pruning redundant features...")
-    for i in tqdm(range(len(cols)), desc="Spearman Filter"):
-        for j in range(i + 1, len(cols)):
-            f1, f2 = cols[i], cols[j]
-            if f1 not in to_drop and f2 not in to_drop:
-                if corr_matrix.loc[f1, f2] > threshold:
-                    if tie_breaker_series is not None:
-                        if tie_breaker_series[f1] <= tie_breaker_series[f2]:
-                            to_drop.add(f2)
-                        else:
-                            to_drop.add(f1)
-                    else:
-                        to_drop.add(f2)
+    if tie_breaker_series is not None:
+        order = sorted(range(len(cols)), key=lambda i: tie_breaker_series[cols[i]])
+    else:
+        order = list(range(len(cols)))
 
-    return df.drop(columns=list(to_drop))
+    kept_indices = []
+    for idx in order:
+        if kept_indices and (corr[idx, kept_indices] > threshold).any():
+            continue
+        kept_indices.append(idx)
+
+    kept_cols = [cols[i] for i in sorted(kept_indices)]
+    print(f"Pruning redundant features: kept {len(kept_cols)} of {len(cols)}")
+    return df[kept_cols]
 
 
 # Implements the fold-specific pruning steps: imputation, scaling, univariate filtering, correlation
 # filtering, and LASSO-based selection. Learns all parameters from X_tr/y_tr only.
-def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cutoff, random_state=RANDOM_STATE):
+DEFAULT_L1_RATIOS = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+
+def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cutoff,
+                      decorrelation_threshold=0.85, penalty='l1', l1_ratios=None,
+                      random_state=RANDOM_STATE):
+    if l1_ratios is None:
+        l1_ratios = DEFAULT_L1_RATIOS
     imputer = KNNImputer(n_neighbors=5)
     X_imp = pd.DataFrame(imputer.fit_transform(X_tr), columns=X_tr.columns, index=X_tr.index)
     scaler = StandardScaler()
@@ -542,7 +557,7 @@ def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cu
 
     initial_n = X_filtered.shape[1]
     p_vals = scorecard.loc[X_filtered.columns, 'p_value']
-    X_spearman = spearman_filter(X_filtered, threshold=0.85, tie_breaker_series=p_vals)
+    X_spearman = spearman_filter(X_filtered, threshold=decorrelation_threshold, tie_breaker_series=p_vals)
     kept_features = X_spearman.columns
     final_n = X_spearman.shape[1]
     print(f"Spearman: Dropped {initial_n - final_n} features (from {initial_n} to {final_n})")
@@ -552,13 +567,32 @@ def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cu
     # fold -- the single biggest driver of the fold-to-fold sign/selection instability we were seeing.
     # class_weight='balanced' added to match every other model in this file; it was previously the
     # only estimator here fit unweighted despite the outcome imbalance.
+    #
+    # penalty='elasticnet' is the textbook fix (Zou & Hastie) for pure L1's behavior on correlated
+    # predictors: LASSO arbitrarily zeros all-but-one of a correlated group (the driver of the
+    # vote-splitting that cluster-tallying addresses downstream), whereas elastic net's ridge
+    # component gives correlated features SIMILAR coefficients -- the "grouping effect" -- so the
+    # group survives or falls together. Note it necessarily selects MORE features per resample than
+    # L1 at comparable C, by design. Requires solver='saga' (liblinear has no elasticnet support),
+    # which is markedly slower and needs a higher max_iter to converge on this scaled data.
     inner_splits = min(5, y_tr.value_counts().min())
     inner_cv = StratifiedKFold(n_splits=inner_splits, shuffle=True, random_state=random_state)
-    lasso_cv = LogisticRegressionCV(
-        Cs=np.logspace(-3, 1, 15), penalty='l1', solver='liblinear', cv=inner_cv,
-        scoring='roc_auc', class_weight='balanced', max_iter=1000, random_state=random_state,
-    )
-    lasso_cv.fit(X_spearman, y_tr)
+    if penalty == 'elasticnet':
+        lasso_cv = LogisticRegressionCV(
+            Cs=np.logspace(-3, 1, 15), penalty='elasticnet', solver='saga', l1_ratios=l1_ratios,
+            cv=inner_cv, scoring='roc_auc', class_weight='balanced', max_iter=5000,
+            random_state=random_state, n_jobs=1,
+        )
+    else:
+        lasso_cv = LogisticRegressionCV(
+            Cs=np.logspace(-3, 1, 15), penalty='l1', solver='liblinear', cv=inner_cv,
+            scoring='roc_auc', class_weight='balanced', max_iter=1000, random_state=random_state,
+        )
+    with warnings.catch_warnings():
+        # saga routinely emits ConvergenceWarning on near-degenerate resamples; the resulting fit is
+        # still usable (and a resample where it truly fails is caught by the caller's except block).
+        warnings.simplefilter("ignore")
+        lasso_cv.fit(X_spearman, y_tr)
 
     coefs = pd.Series(lasso_cv.coef_[0], index=X_spearman.columns)
     nonzero_coefs = coefs[coefs != 0]
@@ -568,6 +602,167 @@ def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cu
     selected = nonzero_coefs.loc[ranked_by_magnitude.head(target_count).index]
     print(f"LASSO: Dropped {len(coefs) - len(selected)} features (from {len(coefs)} to {len(selected)})")
     return selected, imputer, scaler, kept_features, lasso_cv, scorecard
+
+
+def stratified_resample(X, y, frac, rng, replace=False):
+    """Draw a class-stratified resample: each outcome class resampled independently to `frac` of
+    its own size, then concatenated -- guarantees exact class proportions by construction (each
+    class resampled in isolation) rather than by solving a global partition-balance constraint,
+    which is what a stratified K-way split has to do. Floored at 2 patients/class so a resample
+    can never accidentally drop a whole class down to a single (degenerate, no-variance) member."""
+    parts_X, parts_y = [], []
+    for cls in y.unique():
+        idx = y.index[y == cls]
+        n = max(int(round(len(idx) * frac)), 2)
+        n = min(n, len(idx)) if not replace else n
+        drawn = rng.choice(idx, size=n, replace=replace)
+        parts_X.append(X.loc[drawn])
+        parts_y.append(y.loc[drawn])
+    return pd.concat(parts_X), pd.concat(parts_y)
+
+
+# Groups features into correlation clusters (connected components of |Spearman rho| > threshold,
+# same threshold convention as spearman_filter's pairwise pruning), computed ONCE from the whole
+# X passed in -- independent of any resampling. Fixes vote-splitting in stability selection: two
+# correlated near-duplicate columns (e.g. an original-filter feature and a slightly-differently-
+# processed cousin) can each individually "win" the per-resample decorrelation/LASSO race about
+# half the time, making BOTH look unreliable when tallied separately even if the underlying
+# effect they both represent is reliably picked up every single resample. Tallying at the cluster
+# level instead credits the resample to whichever cluster was hit, regardless of which specific
+# member won that particular resample's tie-break.
+# Returns (cluster_of, orientation): cluster_of maps each feature to its cluster's root feature
+# name; orientation maps each feature to +1/-1, the sign of its direct correlation with that
+# root -- used to normalize LASSO coefficient signs onto a common cluster-level direction before
+# checking sign stability (two anti-correlated cluster-mates pushing the SAME underlying effect
+# would otherwise look sign-unstable purely because of which side of zero their raw values sit on).
+# Simplification: orientation is computed against the cluster's root directly, not propagated
+# transitively through the union chain -- fine at this threshold, where clusters are small and
+# tightly correlated, but a long weak transitive chain could rarely misorient a member.
+def compute_correlation_clusters(X, threshold=0.85):
+    # Vectorized (scipy connected_components) instead of a pure-Python O(n^2) pairwise loop --
+    # matters once wavelet/log-sigma are back in the candidate pool (thousands of columns instead
+    # of ~100s), where a Python-level double loop over every pair would be impractically slow.
+    cols = list(X.columns)
+    corr = X.corr(method='spearman').values
+    n = len(cols)
+    adj = np.abs(corr) > threshold
+    np.fill_diagonal(adj, False)
+    n_components, labels = connected_components(csgraph=csr_matrix(adj), directed=False)
+
+    root_of_label = {}
+    for i, c in enumerate(cols):
+        lbl = labels[i]
+        if lbl not in root_of_label:
+            root_of_label[lbl] = c  # first-encountered member of each cluster is its root
+    cluster_of = {c: root_of_label[labels[i]] for i, c in enumerate(cols)}
+
+    corr_df = pd.DataFrame(corr, index=cols, columns=cols)
+    orientation = {}
+    for c in cols:
+        root = cluster_of[c]
+        if c == root:
+            orientation[c] = 1
+        else:
+            r = corr_df.loc[c, root]
+            orientation[c] = -1 if (pd.notna(r) and r < 0) else 1
+    return cluster_of, orientation
+
+
+# Meinshausen-Buhlmann-style stability selection. Replaces the single, full-dev-set feature
+# selection pass that currently produces consensus_features.csv (via run_cross_validation's
+# 5-fold Selection_Frequency -- only 5 noisy trials) with many more (n_resamples) independent,
+# class-stratified subsamples of the whole dev set, each re-running the full screen -> FDR ->
+# decorrelation -> LASSO pipeline (run_fold_pruning, unchanged) from scratch via
+# stratified_resample. Tallying happens at the correlation-CLUSTER level (see
+# compute_correlation_clusters), not per individual column -- a cluster's stability frequency is
+# a far less noisy, less vote-split estimate of "how reliably does this signal get picked" than a
+# 5-trial per-column count, which directly targets both the winner's-curse-style optimism baked
+# into a single full-dev selection pass AND the vote-splitting that per-column tallying suffers
+# from when correlated near-duplicates compete for individual credit. Does NOT replace
+# run_cross_validation's nested-CV OOF diagnostic -- that keeps reselecting fresh per outer fold
+# exactly as before, and stays the honest reference number to compare this method's lock-set
+# result against.
+def run_stability_selection(X, y_dev, target_count, p_value_cutoff, metric, metric_cutoff,
+                             n_resamples=200, resample_frac=0.75, decorrelation_threshold=0.85,
+                             cluster_threshold=None, penalty='l1', l1_ratios=None,
+                             random_state=RANDOM_STATE):
+    # cluster_threshold controls ONLY the post-hoc tallying grouping (compute_correlation_clusters,
+    # run once on the full X). decorrelation_threshold controls ONLY the per-resample pairwise
+    # pruning inside run_fold_pruning (what the penalized model sees). These are DELIBERATELY
+    # independent -- e.g. testing "let elastic net see correlated features directly" means setting
+    # decorrelation_threshold near/at 1.0 while explicitly KEEPING cluster_threshold at its normal
+    # value (0.85), so stability is still tallied at the correlation-cluster level even though the
+    # model itself no longer has features pre-pruned. Conflating the two (as an earlier version of
+    # this function did, by reusing decorrelation_threshold for both) silently disables clustering
+    # itself whenever decorrelation is relaxed -- exactly the wrong thing when testing that scenario.
+    if cluster_threshold is None:
+        cluster_threshold = decorrelation_threshold
+    rng = np.random.default_rng(random_state)
+    cluster_of, orientation = compute_correlation_clusters(X, threshold=cluster_threshold)
+    cluster_members = {}
+    for feat, c in cluster_of.items():
+        cluster_members.setdefault(c, []).append(feat)
+
+    cluster_selection_counts = pd.Series(0, index=sorted(cluster_members), dtype=int)
+    cluster_sign_records = {c: [] for c in cluster_members}
+    member_selection_counts = pd.Series(0, index=X.columns, dtype=int)
+    n_valid = 0
+
+    for _ in tqdm(range(n_resamples), desc="Stability selection resamples"):
+        X_rs, y_rs = stratified_resample(X, y_dev, resample_frac, rng, replace=False)
+        try:
+            selected_coefs, *_ = run_fold_pruning(
+                X_rs, y_rs, target_count, p_value_cutoff, metric, metric_cutoff=metric_cutoff,
+                decorrelation_threshold=decorrelation_threshold, penalty=penalty,
+                l1_ratios=l1_ratios, random_state=random_state,
+            )
+        except RuntimeError:
+            # This resample's screen found nothing -- a valid outcome (a "not selected" vote for
+            # every cluster), not a crash worth stopping the whole procedure over.
+            continue
+        n_valid += 1
+        nonzero = selected_coefs[selected_coefs != 0]
+        member_selection_counts.loc[nonzero.index] += 1
+        # A cluster counts as "selected" at most once per resample, even on the rare occasion
+        # more than one of its members survives that resample's own pairwise decorrelation step.
+        hit_clusters = set()
+        for feat, coef in nonzero.items():
+            c = cluster_of[feat]
+            if c not in hit_clusters:
+                cluster_selection_counts[c] += 1
+                hit_clusters.add(c)
+            cluster_sign_records[c].append(np.sign(coef) * orientation[feat])
+
+    if n_valid == 0:
+        raise RuntimeError(
+            "Stability selection: every resample failed the univariate screen -- no signal "
+            "survives even under resampling. Loosen --metric-cutoff/--p-value-cutoff and re-run."
+        )
+
+    def _sign_stable(c):
+        signs = cluster_sign_records[c]
+        return bool(signs) and (all(s > 0 for s in signs) or all(s < 0 for s in signs))
+
+    rows = []
+    for c, members in cluster_members.items():
+        if cluster_selection_counts[c] == 0:
+            continue
+        # Representative: whichever member was individually selected most often across resamples
+        # -- the concrete column that actually goes into the model for this cluster.
+        representative = member_selection_counts.loc[members].idxmax()
+        rows.append({
+            'Cluster': c,
+            'Representative_Feature': representative,
+            'Cluster_Members': ';'.join(members),
+            'N_Members': len(members),
+            'Selection_Frequency': cluster_selection_counts[c] / n_valid,
+            'Selection_Count': int(cluster_selection_counts[c]),
+            'N_Resamples_Valid': n_valid,
+            'Sign_Stable': _sign_stable(c),
+        })
+    stability_df = pd.DataFrame(rows).set_index('Cluster')
+    stability_df = stability_df.sort_values('Selection_Frequency', ascending=False)
+    return stability_df
 
 
 # --- Cross-validation wrapper --------------------------------------------------------------------------
@@ -583,7 +778,8 @@ NESTED_CV_MODELS = ALL_MODELS
 
 
 def run_cross_validation(X, y_dev, target_count, p_value_cutoff, metric, metric_cutoff,
-                          model_names=None, tuning_cv=5, random_state=RANDOM_STATE):
+                          model_names=None, tuning_cv=5, decorrelation_threshold=0.85,
+                          penalty='l1', l1_ratios=None, random_state=RANDOM_STATE):
     if model_names is None:
         model_names = NESTED_CV_MODELS
 
@@ -596,10 +792,20 @@ def run_cross_validation(X, y_dev, target_count, p_value_cutoff, metric, metric_
         X_tr, y_tr = X.iloc[train_idx], y_dev.iloc[train_idx]
         X_val = X.iloc[val_idx]
 
-        selected_coefs, imputer, scaler, kept_features, lasso, scorecard = run_fold_pruning(
-            X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cutoff=metric_cutoff,
-            random_state=random_state,
-        )
+        try:
+            selected_coefs, imputer, scaler, kept_features, lasso, scorecard = run_fold_pruning(
+                X_tr, y_tr, target_count, p_value_cutoff, metric, metric_cutoff=metric_cutoff,
+                decorrelation_threshold=decorrelation_threshold, penalty=penalty,
+                l1_ratios=l1_ratios, random_state=random_state,
+            )
+        except RuntimeError as exc:
+            # This fold's own screen found 0 candidate features -- a valid outcome for a small
+            # candidate pool (e.g. a single-sequence combo), not a crash worth losing the whole
+            # OOF diagnostic over. Contributes no predictions/coefficients for this fold; the
+            # other folds still pool into an honest (if noisier) OOF estimate. Matches how
+            # run_stability_selection already treats the same exception per resample.
+            print(f"Fold {fold+1}: 0 candidate features passed the screen ({exc}) -- skipping this fold.")
+            continue
 
         fold_coefficients.loc[selected_coefs.index, f'Fold_{fold+1}'] = selected_coefs.values
 
@@ -1371,26 +1577,65 @@ def run_partition_stage(args):
     print(f"After filtering: X_dev has {X_dev_clean_icc.shape[0]} samples, "
           f"y_dev has {len(y_dev_filtered)} samples")
 
+    # Nested-CV OOF diagnostic: unaffected by --feature-selection-method -- always reselects fresh
+    # per outer fold, so it stays the honest reference number to compare either method's final
+    # (fold-consensus or stability-selection) lock-set result against.
     fold_coefficients, global_scorecard, oof_predictions = run_cross_validation(
         X_dev_clean_icc, y_dev_filtered, target_count=args.lasso_target_count,
         p_value_cutoff=args.p_value_cutoff, metric=args.univariate_metric,
-        metric_cutoff=args.metric_cutoff, random_state=RANDOM_STATE,
+        metric_cutoff=args.metric_cutoff, decorrelation_threshold=args.decorrelation_threshold,
+        penalty=args.penalty, l1_ratios=args.l1_ratios, random_state=RANDOM_STATE,
     )
     fold_coefficients.to_csv(f"{args.output_dir}/lasso_coeffs_fold.csv", index=True)
 
-    frequent_features = fold_coefficients[
-        (fold_coefficients['Selection_Frequency'] >= args.min_fold_n) & fold_coefficients['Sign_Stable']
-    ]
-    consensus_features = frequent_features.head(args.target_feature_count).index.tolist()
-
-    if len(consensus_features) == 0:
-        raise RuntimeError(
+    if args.feature_selection_method == 'stability':
+        # Cluster-tallied schema (Cluster index, Representative_Feature column) is incompatible
+        # with the older per-column stability_selection.csv -- a distinct filename avoids silently
+        # misreading a stale cache left over from before this tallying change.
+        stability_cache_path = f"{args.output_dir}/stability_selection_clustered.csv"
+        if os.path.exists(stability_cache_path) and not args.stability_force_recompute:
+            # Re-running just to try a different --stability-threshold doesn't need to redo the
+            # (slow, ~200-resample) selection-frequency computation -- only the frequency cutoff
+            # applied to it changed, not the resamples themselves. Pass --stability-force-recompute
+            # to actually rerun (e.g. after changing --stability-n-resamples/--stability-resample-frac).
+            print(f"Reusing cached stability selection frequencies from: {stability_cache_path}")
+            stability_df = pd.read_csv(stability_cache_path, index_col=0)
+        else:
+            stability_df = run_stability_selection(
+                X_dev_clean_icc, y_dev_filtered, target_count=args.lasso_target_count,
+                p_value_cutoff=args.p_value_cutoff, metric=args.univariate_metric,
+                metric_cutoff=args.metric_cutoff, n_resamples=args.stability_n_resamples,
+                resample_frac=args.stability_resample_frac,
+                decorrelation_threshold=args.decorrelation_threshold,
+                cluster_threshold=args.cluster_threshold, penalty=args.penalty,
+                l1_ratios=args.l1_ratios, random_state=RANDOM_STATE,
+            )
+            stability_df.to_csv(stability_cache_path, index=True)
+        frequent_clusters = stability_df[
+            (stability_df['Selection_Frequency'] >= args.stability_threshold) & stability_df['Sign_Stable']
+        ]
+        consensus_features = frequent_clusters.head(args.target_feature_count)['Representative_Feature'].tolist()
+        selection_error = (
+            f"No consensus features survived stability selection: 0 clusters were selected in "
+            f">= {args.stability_threshold:.0%} of {args.stability_n_resamples} resamples with a "
+            f"stable coefficient sign (see stability_selection_clustered.csv). Loosen "
+            f"--stability-threshold and/or re-run."
+        )
+    else:
+        frequent_features = fold_coefficients[
+            (fold_coefficients['Selection_Frequency'] >= args.min_fold_n) & fold_coefficients['Sign_Stable']
+        ]
+        consensus_features = frequent_features.head(args.target_feature_count).index.tolist()
+        selection_error = (
             f"No consensus features survived selection: 0 features were selected by LASSO in "
             f">= --min-fold-n={args.min_fold_n} of the 5 outer folds with a stable coefficient sign. "
             f"Each fold's own LASSO selection was non-empty (see lasso_coeffs_fold.csv), they just "
             f"didn't overlap enough across folds -- a fold-to-fold selection instability symptom, "
             f"not a data error. Loosen --min-fold-n and/or re-run."
         )
+
+    if len(consensus_features) == 0:
+        raise RuntimeError(selection_error)
 
     # Honest, dev-only nested CV estimate: how well does the whole selection+fit pipeline
     # generalize, pooled across all of X_dev rather than the much smaller lock set. Never touches
@@ -1511,9 +1756,53 @@ def parse_arguments():
              "expected to be significant. Still a q-value, not a raw p-value (0.2 is a common "
              "screening-stage choice).")
     parser.add_argument('--univariate-metric', type=str, default='auc')
+    parser.add_argument('--penalty', choices=['l1', 'elasticnet'], default='l1',
+        help="Penalty for the per-fold/per-resample feature-selection model. 'l1' (default, "
+             "unchanged): pure LASSO via liblinear. 'elasticnet': LASSO+ridge via saga, whose "
+             "grouping effect gives correlated features similar coefficients instead of "
+             "arbitrarily zeroing all but one -- the standard fix for L1's instability on "
+             "correlated predictors. Selects more features per resample by design, and is "
+             "substantially slower (saga + an l1_ratios grid on top of the Cs grid).")
+    parser.add_argument('--l1-ratios', nargs='+', type=float, default=DEFAULT_L1_RATIOS,
+        help="Elastic-net mixing grid, cross-validated alongside C. 1.0 == pure L1, 0.0 == pure "
+             "ridge. Only used when --penalty elasticnet.")
+    parser.add_argument('--cluster-threshold', type=float, default=None,
+        help="Correlation threshold used ONLY for stability-selection's post-hoc tallying "
+             "(compute_correlation_clusters) -- independent of --decorrelation-threshold, which "
+             "controls the per-resample pairwise pruning the penalized model actually sees. "
+             "Defaults to --decorrelation-threshold when not set. Set this explicitly (e.g. to "
+             "0.85) when relaxing/disabling --decorrelation-threshold (e.g. to 1.0, to test "
+             "elastic net on undecorrelated features) -- otherwise clustering gets silently "
+             "disabled too, exactly when it's needed most to keep tallying interpretable.")
+    parser.add_argument('--decorrelation-threshold', type=float, default=0.85,
+        help="Absolute Spearman correlation above which spearman_filter drops one of a pair of "
+             "features (keeping the one with the better univariate p-value). Lower = more "
+             "aggressive pruning of near-duplicate columns (e.g. an original-filter feature and "
+             "its own LoG/wavelet variants), which directly reduces the vote-splitting across "
+             "resamples that stability selection is sensitive to. Applies to both the nested-CV "
+             "OOF diagnostic and whichever --feature-selection-method builds consensus_features, "
+             "for a consistent comparison.")
     parser.add_argument('--metric-cutoff', type=float, default=0.65)
     parser.add_argument('--min-fold-n', type=int, default=3)
     parser.add_argument('--target-feature-count', type=int, default=10)
+    parser.add_argument('--feature-selection-method', choices=['fold-consensus', 'stability'],
+        default='fold-consensus',
+        help="'fold-consensus' (default, unchanged): consensus_features chosen from the same "
+             "5-fold split as the nested-CV OOF diagnostic (--min-fold-n of 5 trials). "
+             "'stability': Meinshausen-Buhlmann stability selection -- many more (see "
+             "--stability-n-resamples), class-stratified resamples of the whole dev set, each "
+             "rerunning the full screen/FDR/decorrelation/LASSO from scratch; keeps features "
+             "selected in >= --stability-threshold of resamples with a stable sign. Targets the "
+             "winner's-curse-style optimism in a single full-dev selection pass -- does not "
+             "change the nested-CV OOF diagnostic, which always reselects fresh per fold either way.")
+    parser.add_argument('--stability-n-resamples', type=int, default=200)
+    parser.add_argument('--stability-resample-frac', type=float, default=0.75,
+        help="Fraction of each outcome class drawn (without replacement) per stability-selection resample.")
+    parser.add_argument('--stability-threshold', type=float, default=0.7,
+        help="Minimum selection frequency across stability-selection resamples to keep a feature.")
+    parser.add_argument('--stability-force-recompute', action='store_true',
+        help="Recompute stability_selection.csv even if one already exists in --output-dir "
+             "(otherwise a cached file is reused -- see run_partition_stage).")
     parser.add_argument('--compare-variables', nargs='+', default=[
         'Age', 'Gender', 'BMI', 'Cirrhosis', 'Capsule (on PVP yes/no)', 'Mosaic appearance (yes/no)',
         'Macrovascular invasion (yes/no)', 'Maximum tumor size on T1 portal venous phase (PVP)',

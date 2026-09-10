@@ -16,6 +16,8 @@ __pycache__/
 Results/
 scripts/radiomics_utils/sweep_logs/
 scripts/radiomics_utils/recurrence_sweep_logs/
+scripts/radiomics_utils/*_logs/
+*.log
 scripts/radiomics_utils/sweep_results.csv
 scripts/radiomics_utils/gridsearch_train_results.csv
 scripts/radiomics_utils/consensus_features.csv
