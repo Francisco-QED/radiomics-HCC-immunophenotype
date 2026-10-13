@@ -59,11 +59,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from scipy.stats import mannwhitneyu, chi2_contingency, spearmanr
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 from sklearn.svm import SVR
 from sklearn.impute import KNNImputer
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
-from sklearn.linear_model import Ridge, LassoCV
+from sklearn.linear_model import Ridge, LassoCV, ElasticNetCV
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from sklearn.preprocessing import StandardScaler
@@ -100,23 +102,46 @@ SPEARMAN_SCORER = make_scorer(_spearman_rho, greater_is_better=True)
 
 def preselect_sequences(df, allowed_sequences, id_col='PatientID'):
     if not allowed_sequences:
+        print("No sequence filter applied. Keeping all features.")
         return df
-    keep_cols = [id_col] if id_col in df.columns else []
+
+    # Match on the leading "{sequence}_" prefix segment, not a substring anywhere in the column
+    # name -- a plain `in` check let 'ap' match "...original_shape_..." (since "shape" contains
+    # "ap"), silently leaking every other sequence's shape features into any combo containing 'ap'.
+    cols_to_keep = [id_col] if id_col in df.columns else []
     for col in df.columns:
-        if col == id_col:
-            continue
-        if any(seq == col.split('_')[0] or col.startswith(seq + '_') for seq in allowed_sequences):
-            keep_cols.append(col)
-    return df[keep_cols]
+        if any(col.lower().startswith(seq.lower() + '_') for seq in allowed_sequences):
+            cols_to_keep.append(col)
+
+    filtered_df = df[cols_to_keep]
+    print(f"Preselection complete. Kept sequences: {allowed_sequences}")
+    print(f"Features reduced from {df.shape[1]} to {filtered_df.shape[1]}")
+    return filtered_df
 
 
 def filter_feature_families(df, exclude_families=None, id_col='PatientID'):
+    """Drop PyRadiomics filter families (e.g. wavelet) from the feature matrix.
+
+    PyRadiomics feature names spell out their filter family explicitly (e.g.
+    'pre_wavelet-LLL_glcm_Autocorrelation'), so a plain substring match is enough -- no other
+    sequence, feature class, or feature name in this dataset contains 'wavelet' as a substring.
+    Wavelet is excluded by default (see --exclude-feature-families): it accounts for ~61% of
+    extracted columns and is the filter family most consistently flagged in the radiomics
+    reproducibility literature as sensitive to acquisition/reconstruction variability, without a
+    matching gain in candidate signal (most of its 8 subbands are highly correlated
+    re-expressions of the same texture).
+    """
     if not exclude_families:
         return df
-    keep_cols = [c for c in df.columns
-                 if c == id_col or not any(fam.lower() in c.lower() for fam in exclude_families)]
-    print(f"Excluded families {exclude_families}: {df.shape[1]} -> {len(keep_cols)} columns")
-    return df[keep_cols]
+
+    cols_to_keep = [
+        col for col in df.columns
+        if col == id_col or not any(fam.lower() in col.lower() for fam in exclude_families)
+    ]
+    filtered_df = df[cols_to_keep]
+    print(f"Filtered out feature families {exclude_families}. "
+          f"Features reduced from {df.shape[1]} to {filtered_df.shape[1]}")
+    return filtered_df
 
 
 # --- Clinical / MRI semantic features (unchanged from main_pipeline.py) ----------------------------
@@ -177,7 +202,7 @@ def load_clinical_features(clinical_data_path, id_col='PatientID'):
 # split than the classification pipeline's binary stratification does.
 def partition_with_constraints(df_filtered, outcomes_path, icc_path, clinical_data_path, label_col,
                                 test_size, output_dir, random_state=PARTITION_SEED,
-                                clinical_output_dir=None):
+                                clinical_output_dir=None, split_file=None):
     df_outcomes = pd.read_excel(outcomes_path)
     n_before = len(df_outcomes)
     df_outcomes = df_outcomes[df_outcomes[label_col].notna()].copy()
@@ -202,9 +227,25 @@ def partition_with_constraints(df_filtered, outcomes_path, icc_path, clinical_da
     # stratify= needs discrete groups, and this label already only takes 4 distinct values.
     strata = y_rest.round().astype(int)
 
-    X_dev_rest, X_lock, y_dev_rest, y_lock = train_test_split(
-        X_rest, y_rest, test_size=test_size, stratify=strata, random_state=random_state
-    )
+
+    if split_file:
+        # Externally-defined dev/lock assignment (final_pipeline/make_split.py): one split shared by
+        # every design/cutoff in a run, instead of re-splitting per cutoff.
+        _split = pd.read_csv(split_file).set_index('PatientID')['set']
+        _unassigned = X_rest.index.difference(_split.index)
+        if len(_unassigned):
+            raise ValueError(f"--split-file has no assignment for {len(_unassigned)} patients "
+                             f"(first: {list(_unassigned[:5])}). Regenerate the split after a cohort change.")
+        _lock_ids = [i for i in X_rest.index if _split.loc[i] == 'lock']
+        _must_dev = [i for i in df_dev_must.index if _split.get(i) == 'lock']
+        if _must_dev:
+            raise ValueError(f"Inter-reader (ICC) patients assigned to lock in --split-file: {_must_dev}")
+        X_lock, y_lock = X_rest.loc[_lock_ids], y_rest.loc[_lock_ids]
+        X_dev_rest, y_dev_rest = X_rest.drop(index=_lock_ids), y_rest.drop(index=_lock_ids)
+    else:
+        X_dev_rest, X_lock, y_dev_rest, y_lock = train_test_split(
+            X_rest, y_rest, test_size=test_size, stratify=strata, random_state=random_state
+        )
 
     X_dev = pd.concat([df_dev_must.drop(columns=['y_reg']), X_dev_rest])
     y_dev = pd.concat([df_dev_must['y_reg'], y_dev_rest])
@@ -302,29 +343,35 @@ def global_cleanup(df, cv_threshold, id_col='PatientID'):
 def interobserver_stability(df, path_r1, path_r2, threshold, id_col='PatientID'):
     df_r1 = pd.read_csv(path_r1)
     df_r2 = pd.read_csv(path_r2)
+
     common_ids = np.intersect1d(df_r1[id_col], df_r2[id_col])
     r1 = df_r1.set_index(id_col).loc[common_ids].sort_index()
     r2 = df_r2.set_index(id_col).loc[common_ids].sort_index()
-    features = [f for f in df.columns if f in r1.columns and f in r2.columns and r1[f].dtype != 'object']
+
+    features = [f for f in df.columns
+                if f in r1.columns and f in r2.columns and r1[f].dtype != 'object']
     r1, r2 = r1[features], r2[features]
     n = len(common_ids)
     print(f"ICC: {len(features)} features across {n} patients (vectorized)...")
+
     r1_arr = r1.values.astype(float)
     r2_arr = r2.values.astype(float)
-    valid = ~(np.isnan(r1_arr).any(axis=0) | np.isnan(r2_arr).any(axis=0))
+    valid   = ~(np.isnan(r1_arr).any(axis=0) | np.isnan(r2_arr).any(axis=0))
     r1_v, r2_v = r1_arr[:, valid], r2_arr[:, valid]
     valid_feats = [f for f, v in zip(features, valid) if v]
-    gm = (r1_v.mean(0) + r2_v.mean(0)) / 2
-    sm = (r1_v + r2_v) / 2
-    SS_b = 2 * ((sm - gm) ** 2).sum(0)
-    SS_r = n * ((r1_v.mean(0) - gm) ** 2 + (r2_v.mean(0) - gm) ** 2)
+
+    gm     = (r1_v.mean(0) + r2_v.mean(0)) / 2
+    sm     = (r1_v + r2_v) / 2
+    SS_b   = 2 * ((sm - gm) ** 2).sum(0)
+    SS_r   = n * ((r1_v.mean(0) - gm) ** 2 + (r2_v.mean(0) - gm) ** 2)
     SS_tot = ((r1_v - gm) ** 2).sum(0) + ((r2_v - gm) ** 2).sum(0)
-    MS_b = SS_b / (n - 1)
-    MS_e = (SS_tot - SS_b - SS_r) / (n - 1)
-    denom = MS_b + MS_e
-    icc3 = np.where(denom > 0, (MS_b - MS_e) / denom, 0.0)
+    MS_b   = SS_b / (n - 1)
+    MS_e   = (SS_tot - SS_b - SS_r) / (n - 1)
+    denom  = MS_b + MS_e
+    icc3   = np.where(denom > 0, (MS_b - MS_e) / denom, 0.0)
+
     stable = [f for f, c in zip(valid_feats, icc3) if c >= threshold]
-    print(f"ICC >= {threshold}: {len(stable)} / {len(features)} features kept.")
+    print(f"ICC ≥ {threshold}: {len(stable)} / {len(features)} features kept.")
     return df[stable]
 
 
@@ -360,23 +407,31 @@ def calculate_feature_metrics(X, y):
 
 # Unchanged from main_pipeline.py -- outcome-agnostic (works on any numeric DataFrame).
 def spearman_filter(df, threshold, tie_breaker_series):
-    corr_matrix = df.corr(method='spearman').abs()
-    to_drop = set()
-    cols = df.columns
-    print("Pruning redundant features...")
-    for i in tqdm(range(len(cols)), desc="Spearman Filter"):
-        for j in range(i + 1, len(cols)):
-            f1, f2 = cols[i], cols[j]
-            if f1 not in to_drop and f2 not in to_drop:
-                if corr_matrix.loc[f1, f2] > threshold:
-                    if tie_breaker_series is not None:
-                        if tie_breaker_series[f1] <= tie_breaker_series[f2]:
-                            to_drop.add(f2)
-                        else:
-                            to_drop.add(f1)
-                    else:
-                        to_drop.add(f2)
-    return df.drop(columns=list(to_drop))
+    # Vectorized greedy: process features best-tie-breaker-first, keep a feature unless it's
+    # already too correlated with something already kept (a single numpy comparison against the
+    # kept set, not a per-pair Python loop). This is a behavioral refinement over the original
+    # pairwise-in-column-order loop, not just a speedup: the original's survivor set depended on
+    # incidental column order (a feature only got compared against earlier-indexed columns first),
+    # whereas this always lets the better-tie-breaker feature win regardless of column position --
+    # matters once the candidate pool is in the thousands (wavelet/log-sigma restored) rather than
+    # the ~100s a pure-Python O(n^2) loop was fine for.
+    cols = list(df.columns)
+    corr = df.corr(method='spearman').abs().values
+
+    if tie_breaker_series is not None:
+        order = sorted(range(len(cols)), key=lambda i: tie_breaker_series[cols[i]])
+    else:
+        order = list(range(len(cols)))
+
+    kept_indices = []
+    for idx in order:
+        if kept_indices and (corr[idx, kept_indices] > threshold).any():
+            continue
+        kept_indices.append(idx)
+
+    kept_cols = [cols[i] for i in sorted(kept_indices)]
+    print(f"Pruning redundant features: kept {len(kept_cols)} of {len(cols)}")
+    return df[kept_cols]
 
 
 def _safe_stratified_splits(X, y, n_splits, random_state):
@@ -392,8 +447,12 @@ def _safe_stratified_splits(X, y, n_splits, random_state):
 
 # Regression counterpart of run_fold_pruning: Spearman effect-size screen -> FDR within the screened
 # pool -> Spearman decorrelation -> LassoCV consensus selection (in place of LogisticRegressionCV L1).
+DEFAULT_L1_RATIOS = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+
 def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric_cutoff,
-                      decorrelation_threshold=0.85, random_state=RANDOM_STATE):
+                      decorrelation_threshold=0.85, penalty='l1', l1_ratios=None,
+                      random_state=RANDOM_STATE):
     imputer = KNNImputer(n_neighbors=5)
     X_imp = pd.DataFrame(imputer.fit_transform(X_tr), columns=X_tr.columns, index=X_tr.index)
     scaler = StandardScaler()
@@ -434,7 +493,13 @@ def run_fold_pruning(X_tr, y_tr, target_count, p_value_cutoff, metric_cutoff,
     # arbitrary `scoring=`, unlike LogisticRegressionCV -- so the CV-selected alpha is MSE-optimal,
     # then features are ranked/capped by |coefficient| exactly as in the classification pipeline.
     inner_splits = _safe_stratified_splits(X_spearman, y_tr, 5, random_state)
-    lasso_cv = LassoCV(cv=inner_splits, max_iter=10000, n_alphas=100, random_state=random_state)
+    # penalty='elasticnet': ElasticNetCV over the same l1_ratios grid as main_pipeline.py's
+    # classification elastic net (ridge component gives correlated features similar coefficients).
+    if penalty == 'elasticnet':
+        lasso_cv = ElasticNetCV(l1_ratio=l1_ratios or DEFAULT_L1_RATIOS, cv=inner_splits, max_iter=10000,
+                                n_alphas=100, random_state=random_state)
+    else:
+        lasso_cv = LassoCV(cv=inner_splits, max_iter=10000, n_alphas=100, random_state=random_state)
     lasso_cv.fit(X_spearman, y_tr)
 
     coefs = pd.Series(lasso_cv.coef_, index=X_spearman.columns)
@@ -465,17 +530,59 @@ def stratified_resample(X, y, frac, rng, replace=False):
     return pd.concat(parts_X), pd.concat(parts_y)
 
 
+def compute_correlation_clusters(X, threshold=0.85):
+    # Vectorized (scipy connected_components) instead of a pure-Python O(n^2) pairwise loop --
+    # matters once wavelet/log-sigma are back in the candidate pool (thousands of columns instead
+    # of ~100s), where a Python-level double loop over every pair would be impractically slow.
+    cols = list(X.columns)
+    corr = X.corr(method='spearman').values
+    n = len(cols)
+    adj = np.abs(corr) > threshold
+    np.fill_diagonal(adj, False)
+    n_components, labels = connected_components(csgraph=csr_matrix(adj), directed=False)
+
+    root_of_label = {}
+    for i, c in enumerate(cols):
+        lbl = labels[i]
+        if lbl not in root_of_label:
+            root_of_label[lbl] = c  # first-encountered member of each cluster is its root
+    cluster_of = {c: root_of_label[labels[i]] for i, c in enumerate(cols)}
+
+    corr_df = pd.DataFrame(corr, index=cols, columns=cols)
+    orientation = {}
+    for c in cols:
+        root = cluster_of[c]
+        if c == root:
+            orientation[c] = 1
+        else:
+            r = corr_df.loc[c, root]
+            orientation[c] = -1 if (pd.notna(r) and r < 0) else 1
+    return cluster_of, orientation
+
+
 # Meinshausen-Buhlmann-style stability selection -- regression counterpart of main_pipeline.py's
-# run_stability_selection. Same rationale: replaces the single, full-dev-set LassoCV pass that
-# currently produces consensus_features.csv with many independent, class(TILs-level)-stratified
-# resamples, each rerunning run_fold_pruning from scratch, tallying selection frequency + sign
-# stability. Does not touch/replace run_cross_validation's nested-CV OOF diagnostic.
+# run_stability_selection, INCLUDING its cluster-level tallying: many independent TILs-level-
+# stratified resamples each rerun run_fold_pruning from scratch, but a cluster of correlated
+# features counts as "selected" in a resample if any member got a nonzero coefficient (at most once
+# per resample), and sign stability is checked on orientation-normalized coefficients. This stops
+# near-duplicate features from splitting votes. Does not touch run_cross_validation's nested-CV OOF.
+# cluster_threshold controls ONLY the post-hoc grouping; decorrelation_threshold ONLY the
+# per-resample pairwise pruning (kept independent on purpose, as in main_pipeline.py).
 def run_stability_selection(X, y_dev, target_count, p_value_cutoff, metric_cutoff,
                              n_resamples=200, resample_frac=0.75, decorrelation_threshold=0.85,
+                             cluster_threshold=None, penalty='l1', l1_ratios=None,
                              random_state=RANDOM_STATE):
+    if cluster_threshold is None:
+        cluster_threshold = decorrelation_threshold
     rng = np.random.default_rng(random_state)
-    selection_counts = pd.Series(0, index=X.columns, dtype=int)
-    sign_records = {col: [] for col in X.columns}
+    cluster_of, orientation = compute_correlation_clusters(X, threshold=cluster_threshold)
+    cluster_members = {}
+    for feat, c in cluster_of.items():
+        cluster_members.setdefault(c, []).append(feat)
+
+    cluster_selection_counts = pd.Series(0, index=sorted(cluster_members), dtype=int)
+    cluster_sign_records = {c: [] for c in cluster_members}
+    member_selection_counts = pd.Series(0, index=X.columns, dtype=int)
     n_valid = 0
 
     for _ in tqdm(range(n_resamples), desc="Stability selection resamples"):
@@ -483,15 +590,21 @@ def run_stability_selection(X, y_dev, target_count, p_value_cutoff, metric_cutof
         try:
             selected_coefs, *_ = run_fold_pruning(
                 X_rs, y_rs, target_count, p_value_cutoff, metric_cutoff=metric_cutoff,
-                decorrelation_threshold=decorrelation_threshold, random_state=random_state,
+                decorrelation_threshold=decorrelation_threshold, penalty=penalty,
+                l1_ratios=l1_ratios, random_state=random_state,
             )
         except RuntimeError:
             continue
         n_valid += 1
         nonzero = selected_coefs[selected_coefs != 0]
-        selection_counts.loc[nonzero.index] += 1
+        member_selection_counts.loc[nonzero.index] += 1
+        hit_clusters = set()
         for feat, coef in nonzero.items():
-            sign_records[feat].append(np.sign(coef))
+            c = cluster_of[feat]
+            if c not in hit_clusters:
+                cluster_selection_counts[c] += 1
+                hit_clusters.add(c)
+            cluster_sign_records[c].append(np.sign(coef) * orientation[feat])
 
     if n_valid == 0:
         raise RuntimeError(
@@ -499,26 +612,35 @@ def run_stability_selection(X, y_dev, target_count, p_value_cutoff, metric_cutof
             "survives even under resampling. Loosen --metric-cutoff/--p-value-cutoff and re-run."
         )
 
-    def _sign_stable(feat):
-        signs = sign_records[feat]
+    def _sign_stable(c):
+        signs = cluster_sign_records[c]
         return bool(signs) and (all(s > 0 for s in signs) or all(s < 0 for s in signs))
 
-    stability_df = pd.DataFrame({
-        'Selection_Frequency': selection_counts / n_valid,
-        'Selection_Count': selection_counts,
-        'N_Resamples_Valid': n_valid,
-        'Sign_Stable': [_sign_stable(f) for f in X.columns],
-    })
-    stability_df = stability_df[stability_df['Selection_Count'] > 0]
-    stability_df = stability_df.sort_values('Selection_Frequency', ascending=False)
-    return stability_df
+    rows = []
+    for c, members in cluster_members.items():
+        if cluster_selection_counts[c] == 0:
+            continue
+        rows.append({
+            'Cluster': c,
+            'Representative_Feature': member_selection_counts.loc[members].idxmax(),
+            'Cluster_Members': ';'.join(members),
+            'N_Members': len(members),
+            'Selection_Frequency': cluster_selection_counts[c] / n_valid,
+            'Selection_Count': int(cluster_selection_counts[c]),
+            'N_Resamples_Valid': n_valid,
+            'Sign_Stable': _sign_stable(c),
+        })
+    if not rows:
+        return pd.DataFrame(columns=['Representative_Feature', 'Cluster_Members', 'N_Members', 'Selection_Frequency',
+                                     'Selection_Count', 'N_Resamples_Valid', 'Sign_Stable'])
+    return pd.DataFrame(rows).set_index('Cluster').sort_values('Selection_Frequency', ascending=False)
 
 
 # --- Cross-validation wrapper --------------------------------------------------------------------------
 
 def run_cross_validation(X, y_dev, target_count, p_value_cutoff, metric_cutoff,
                           model_names=None, tuning_cv=5, decorrelation_threshold=0.85,
-                          random_state=RANDOM_STATE):
+                          penalty='l1', l1_ratios=None, random_state=RANDOM_STATE):
     if model_names is None:
         model_names = NESTED_CV_MODELS
 
@@ -535,7 +657,8 @@ def run_cross_validation(X, y_dev, target_count, p_value_cutoff, metric_cutoff,
         try:
             selected_coefs, imputer, scaler, kept_features, lasso, scorecard = run_fold_pruning(
                 X_tr, y_tr, target_count, p_value_cutoff, metric_cutoff=metric_cutoff,
-                decorrelation_threshold=decorrelation_threshold, random_state=random_state,
+                decorrelation_threshold=decorrelation_threshold, penalty=penalty,
+                l1_ratios=l1_ratios, random_state=random_state,
             )
         except RuntimeError as exc:
             # This fold's own screen found 0 candidate features -- a valid outcome for a small
@@ -997,7 +1120,7 @@ def run_partition_stage(args):
     X_dev, y_dev, X_lock, y_lock, df_clinical_dev, df_clinical_lock = partition_with_constraints(
         df_filtered, args.outcomes_path, args.icc_path, clinical_data_path=args.clinical_data_path,
         label_col=args.label_col, test_size=args.test_size, output_dir=args.output_dir,
-        clinical_output_dir=args.clinical_output_dir,
+        clinical_output_dir=args.clinical_output_dir, split_file=args.split_file,
     )
 
     _clin_dir = args.clinical_output_dir or args.output_dir
@@ -1022,12 +1145,13 @@ def run_partition_stage(args):
     fold_coefficients, global_scorecard, oof_predictions, n_folds = run_cross_validation(
         X_dev_clean_icc, y_dev_filtered, target_count=args.lasso_target_count,
         p_value_cutoff=args.p_value_cutoff, metric_cutoff=args.metric_cutoff,
-        decorrelation_threshold=args.decorrelation_threshold, random_state=RANDOM_STATE,
+        decorrelation_threshold=args.decorrelation_threshold, penalty=args.penalty,
+        l1_ratios=args.l1_ratios, random_state=RANDOM_STATE,
     )
     fold_coefficients.to_csv(f"{args.output_dir}/lasso_coeffs_fold.csv", index=True)
 
     if args.feature_selection_method == 'stability':
-        stability_cache_path = f"{args.output_dir}/stability_selection.csv"
+        stability_cache_path = f"{args.output_dir}/stability_selection_clustered.csv"
         if os.path.exists(stability_cache_path) and not args.stability_force_recompute:
             print(f"Reusing cached stability selection frequencies from: {stability_cache_path}")
             stability_df = pd.read_csv(stability_cache_path, index_col=0)
@@ -1036,17 +1160,19 @@ def run_partition_stage(args):
                 X_dev_clean_icc, y_dev_filtered, target_count=args.lasso_target_count,
                 p_value_cutoff=args.p_value_cutoff, metric_cutoff=args.metric_cutoff,
                 n_resamples=args.stability_n_resamples, resample_frac=args.stability_resample_frac,
-                decorrelation_threshold=args.decorrelation_threshold, random_state=RANDOM_STATE,
+                decorrelation_threshold=args.decorrelation_threshold,
+                cluster_threshold=args.cluster_threshold, penalty=args.penalty,
+                l1_ratios=args.l1_ratios, random_state=RANDOM_STATE,
             )
             stability_df.to_csv(stability_cache_path, index=True)
         frequent_features = stability_df[
             (stability_df['Selection_Frequency'] >= args.stability_threshold) & stability_df['Sign_Stable']
         ]
-        consensus_features = frequent_features.head(args.target_feature_count).index.tolist()
+        consensus_features = frequent_features.head(args.target_feature_count)['Representative_Feature'].tolist()
         selection_error = (
-            f"No consensus features survived stability selection: 0 features were selected in "
+            f"No consensus features survived stability selection: 0 clusters were selected in "
             f">= {args.stability_threshold:.0%} of {args.stability_n_resamples} resamples with a "
-            f"stable coefficient sign (see stability_selection.csv). Loosen --stability-threshold "
+            f"stable coefficient sign (see stability_selection_clustered.csv). Loosen --stability-threshold "
             f"and/or re-run."
         )
     else:
@@ -1145,11 +1271,20 @@ def parse_arguments():
     parser.add_argument('--icc-path', type=str, default=None)
     parser.add_argument('--label-col', type=str, default='TILs_resection')
     parser.add_argument('--test-size', type=int, default=30)
+    parser.add_argument('--split-file', type=str, default=None,
+        help="CSV with columns PatientID,set (dev|lock). Replaces the internal stratified split.")
     parser.add_argument('--cv-threshold', type=float, default=0.1)
     parser.add_argument('--icc-threshold', type=float, default=0.85)
     parser.add_argument('--decorrelation-threshold', type=float, default=0.85,
         help="Absolute Spearman correlation above which spearman_filter drops one of a pair of "
              "features. See main_pipeline.py's identical flag/rationale.")
+    parser.add_argument('--penalty', choices=['l1', 'elasticnet'], default='l1',
+        help="Regression L1 (LassoCV) or elastic net (ElasticNetCV over --l1-ratios). Same role as "
+             "main_pipeline.py's --penalty.")
+    parser.add_argument('--l1-ratios', nargs='+', type=float, default=DEFAULT_L1_RATIOS)
+    parser.add_argument('--cluster-threshold', type=float, default=None,
+        help="|Spearman rho| above which features are grouped into one cluster for stability tallying. "
+             "Defaults to --decorrelation-threshold. See main_pipeline.py's identical flag.")
     parser.add_argument('--lasso-target-count', type=int, default=100)
     parser.add_argument('--p-value-cutoff', type=float, default=0.2,
         help="FDR q-value threshold within the effect-size-screened pool. Same semantics as main_pipeline.py.")

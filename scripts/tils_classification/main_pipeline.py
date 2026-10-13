@@ -210,7 +210,7 @@ def load_clinical_features(clinical_data_path, id_col='PatientID'):
 # test_size: Number of patients to include in the lock set.
 def partition_with_constraints(df_filtered, outcomes_path, icc_path, clinical_data_path, label_col,
                                 cutoff, test_size, output_dir, random_state=PARTITION_SEED,
-                                clinical_output_dir=None):
+                                clinical_output_dir=None, split_file=None):
     df_outcomes = pd.read_excel(outcomes_path)
     # NaN >= cutoff evaluates to False in pandas, which .astype(int) would silently turn into a
     # confirmed "0" (low) label -- patients with unscorable label_col (e.g. "No tumor in slide",
@@ -244,12 +244,28 @@ def partition_with_constraints(df_filtered, outcomes_path, icc_path, clinical_da
     X_rest = df_rest.drop(columns=['y_bin'])
     y_rest = df_rest['y_bin']
 
-    X_dev_rest, X_lock, y_dev_rest, y_lock = train_test_split(
-        X_rest, y_rest,
-        test_size=test_size,
-        stratify=y_rest,
-        random_state=random_state
-    )
+
+    if split_file:
+        # Externally-defined dev/lock assignment (final_pipeline/make_split.py): one split shared by
+        # every design/cutoff in a run, instead of re-splitting per cutoff.
+        _split = pd.read_csv(split_file).set_index('PatientID')['set']
+        _unassigned = X_rest.index.difference(_split.index)
+        if len(_unassigned):
+            raise ValueError(f"--split-file has no assignment for {len(_unassigned)} patients "
+                             f"(first: {list(_unassigned[:5])}). Regenerate the split after a cohort change.")
+        _lock_ids = [i for i in X_rest.index if _split.loc[i] == 'lock']
+        _must_dev = [i for i in df_dev_must.index if _split.get(i) == 'lock']
+        if _must_dev:
+            raise ValueError(f"Inter-reader (ICC) patients assigned to lock in --split-file: {_must_dev}")
+        X_lock, y_lock = X_rest.loc[_lock_ids], y_rest.loc[_lock_ids]
+        X_dev_rest, y_dev_rest = X_rest.drop(index=_lock_ids), y_rest.drop(index=_lock_ids)
+    else:
+        X_dev_rest, X_lock, y_dev_rest, y_lock = train_test_split(
+            X_rest, y_rest,
+            test_size=test_size,
+            stratify=y_rest,
+            random_state=random_state
+        )
 
     X_dev = pd.concat([df_dev_must.drop(columns=['y_bin']), X_dev_rest])
     y_dev = pd.concat([df_dev_must['y_bin'], y_dev_rest])
@@ -1555,6 +1571,7 @@ def run_partition_stage(args):
         test_size=args.test_size,
         output_dir=args.output_dir,
         clinical_output_dir=args.clinical_output_dir,
+        split_file=args.split_file,
     )
 
     _clin_dir = args.clinical_output_dir or args.output_dir
@@ -1744,6 +1761,9 @@ def parse_arguments():
     parser.add_argument('--label-col', type=str, default='TILs_resection')
     parser.add_argument('--cutoff', type=float, default=3)
     parser.add_argument('--test-size', type=int, default=30)
+    parser.add_argument('--split-file', type=str, default=None,
+        help="CSV with columns PatientID,set (dev|lock). When given, replaces the internal "
+             "stratified split (--test-size is then ignored). See final_pipeline/make_split.py.")
     parser.add_argument('--cv-threshold', type=float, default=0.1,
         help="Minimum coefficient of variation (std / |mean|) to keep a feature in global_cleanup. "
              "Scale-invariant replacement for the old raw-std threshold.")

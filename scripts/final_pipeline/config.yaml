@@ -1,0 +1,104 @@
+# Final pipeline config (DRAFT, 2026-10-13) -- one file drives the whole analysis.
+# Re-run after the replaced patient's radiomics arrive:   python run_pipeline.py --config config.yaml
+# Everything that affects a number lives here; nothing is hard-coded in the stage scripts.
+
+paths:
+  # ONE root for the whole project (OneDrive is the single source of truth -- no T7 copies).
+  root: "~/Library/CloudStorage/OneDrive-TheMountSinaiHospital/Regeneron retrospective radiomics"
+  inputs:
+    radiomics_sheets: Results/Radiomics_sheets      # {cohort}/R-{cohort}_I-sitkBSpline_S-1mm_W-{binwidth}.csv
+    databases: databases
+  outputs: Results/main_pipeline/final              # everything the pipeline writes lands under here, in <run.name>/
+  archive: Results/main_pipeline/_archive_pre_2026-10
+
+run:
+  name: cohort_v2_sa2pre              # output folder label; change when the cohort/variant changes
+  python: /usr/bin/python3            # 3.9.6 -- the interpreter that has xgboost/tabpfn/shap
+  n_jobs: 6
+  seeds:
+    partition: 997                    # dev/lock split
+    cv: 42                            # all CV, resampling, permutation
+
+data:
+  binwidth: perseq                    # perseq | 5 | 20 -- picks the filename suffix for ALL sheets at once
+  features:                           # merged at load time; the run aborts if IDs overlap or columns differ
+    - {cohort: SA1,         note: untreated, imaging~resection}
+    - {cohort: SA2_pre_new, note: pre-treatment MRI}   # switch to SA2-post for the post-treatment variant
+  reader1_cohort: inter-reader/Reader1            # -> R-Reader1_I-sitkBSpline_S-1mm_W-{binwidth}.csv
+  reader2_cohort: inter-reader/Reader2
+  mastersheet: mastersheet_2026-10-13.xlsx        # single source of truth (relative to paths.inputs.databases)
+  sa2_tab: SA2-pre                                # SA2-pre | SA2-post -- feeds build_tables_from_mastersheet.py
+  outcomes_xlsx: immunophenotype_outcomes_v2.xlsx # derived from the mastersheet, never hand-edited
+  clinical_xlsx: SA1-2_clinical_imaging_v2.xlsx
+  id_col: PatientID
+  label_col: TILs_resection
+  # Guard rails: the run aborts (not warns) if these do not hold, so a stale/mismatched sheet can't slip through.
+  expected_n_features_patients: 140
+  require_outcome_and_clinical_rows: true         # every feature patient needs a TILs value + clinical row, else listed + abort
+  cohort_changes:                                 # documentation, written to the run manifest
+    removed_vs_2026-07: [P042, P050, P097, P118]  # had NaN TILs (rejected)
+    added_vs_2026-07:   [P141, P147, P155, P197]  # TILs + demographics now in the mastersheet; no qualitative MRI fields yet
+    newly_scored: [P025]                          # had NaN TILs before
+    tils_changed: [P003, P014, P043, P065, P067, P112]   # SA1 re-reads, mastersheet is authoritative
+
+preprocessing:
+  exclude_feature_families: [wavelet, log-sigma]   # [] keeps everything
+  cv_threshold: 0.10                  # variance filter
+  icc_threshold: 0.85                 # inter-reader ICC
+  split:
+    test_size: 30
+    mode: resplit                     # fresh split, stratified on the 4 TILs levels (0/1/2/3); one split shared by every design
+
+# ---- WHAT to model: any number of designs; each one is run independently ----
+designs:
+  - {id: tils_ge3,  type: binary,  cutoff: 3}      # TILs>=3 vs 0-2  (32/68%)
+  - {id: tils_ge2,  type: binary,  cutoff: 2}      # TILs>=2 vs 0-1  (82/18%)
+  - {id: tils_ord,  type: ordinal, levels: [0, 1, 2, 3]}   # Spearman-ranked regression on 0-3
+  # optional: {id: tils_po, type: proportional_odds}  -- not implemented yet
+
+# ---- WHICH sequences ----
+sequences:
+  pool: [pre, ap, pvp, tp, hbp, t2, dwi_b1, dwi_b2, adc]
+  mode: explicit                      # explicit | enumerate
+  explicit:                           # the 7 pre-specified LI-RADS combos
+    - [ap, pvp, hbp, dwi_b1, adc]
+    - [ap, pvp, hbp, dwi_b1, adc, t2]
+    - [ap, tp,  hbp, dwi_b1, adc]
+    - [ap, pvp, tp,  dwi_b1, adc]
+    - [pre, ap, pvp, hbp, dwi_b1, adc]
+    - [ap, pvp, hbp, dwi_b2, adc]
+    - [pre, ap, pvp, tp, hbp]
+  enumerate: {min_size: 1, max_size: 5, require_any_of: null}   # used only when mode: enumerate
+  max_missing_patients: 0             # drop a combo (log it) if it would shrink n below this margin
+
+# ---- HOW features are selected / models fit (fold-internal in every case) ----
+selection:
+  method: stability                   # stability | fold_consensus | topk_filter
+  stability: {n_resamples: 200, resample_frac: 0.75, threshold: 0.70, cluster_threshold: 0.85, sign_stable_required: true}
+  penalty: l1                         # l1 | elasticnet | ridge
+  l1_ratios: [0.1, 0.3, 0.5, 0.7, 0.9]
+  decorrelation_threshold: 0.85
+  target_feature_count: 10            # cap on final signature size
+  topk_filter: {k_values: [25, 50, 100], metric: auc}   # used only when method: topk_filter
+
+models:
+  binary:  [logistic, svm_linear, svm_rbf, rf, extratrees, xgboost, gp, tabpfn]
+  ordinal: [linear, svm_linear, svm_rbf, rf, extratrees, xgboost, gp, tabpfn]
+
+# ---- HOW results are judged ----
+evaluation:
+  nested_cv: {outer_folds: 5, bootstrap_ci: 1000}   # dev-only OOF is the primary, honest estimate
+  permutation_null:
+    enabled: true
+    n_permutations: 200               # label shuffles through the FULL selection+OOF procedure
+    statistic: max_over_cells         # null of "best OOF across every cell in this run" -> multiplicity-corrected p
+  lock:
+    run_for: preregistered_only       # preregistered_only | none | all
+    preregistered: []                 # list of "design_id/combo" strings, fixed BEFORE looking at OOF
+    # lock numbers are reported next to that cell's own OOF and flagged when they diverge
+  shap: {enabled: false, top_rank_only: true}
+
+reporting:
+  clinical_comparison_table: true     # dev vs lock cohort table
+  cell_summary_csv: true              # one row per design x combo: n, n_features, OOF AUC/rho + CI, permutation p
+  n_cells_reported: true              # total trials this run, stated in every summary
