@@ -1,6 +1,6 @@
 # Methods: HCC Recurrence Survival Pipeline
 
-Covers `scripts/radiomics_utils/recurrence_pipeline.py` (stages: `partition` → `gridsearch` →
+Covers `scripts/recurrence/recurrence_pipeline.py` (stages: `partition` → `gridsearch` →
 `train`), orchestrated across sequence combinations by `recurrence_sweep.py` /
 `recurrence_gridsearch_train_sweep.py`. Methods only — results are reported separately once the
 current sweep completes. Feature extraction (Section 1) is shared with the classification

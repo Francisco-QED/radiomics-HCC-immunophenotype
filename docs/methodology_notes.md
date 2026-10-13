@@ -7,11 +7,14 @@ Update this as decisions change — it's meant to travel with the repo across ma
 ## Context
 
 `main_pipeline.py` (partition -> gridsearch -> train) assumes radiomics features were
-already extracted correctly. That extraction currently uses a single fixed `binWidth: 5`
-across all 9 sequences (`pre, ap, pvp, tp, hbp, t2, dwi_b1, dwi_b2, adc`), plus LoG
-(sigma 2-5) and full wavelet decompositions, producing a very large feature space per
-sequence. Two things are under active review: whether bin width should be sequence-
-specific, and whether N4 bias correction should be applied uniformly.
+already extracted correctly. Extraction covers 9 sequences (`pre, ap, pvp, tp, hbp, t2,
+dwi_b1, dwi_b2, adc`), plus LoG and wavelet decompositions, producing a very large
+feature space per sequence. `execution.bin_widths` in `radiomics_params.yaml` currently
+sweeps `['perseq', 20]`, where `perseq` uses the per-sequence widths in
+`execution.per_sequence_bin_widths` (see below); uniform widths of 5 and 20 were also
+extracted for SA2 / SA2-post. Both open questions from the original audit have been
+acted on: bin width is now sequence-specific, and N4 is skipped for `adc`, `dwi_b1`,
+`dwi_b2` (`execution.sequences_without_n4`).
 
 ## Bin width: should be sequence-specific, and how
 
@@ -21,14 +24,14 @@ specific, and whether N4 bias correction should be applied uniformly.
 - Existing infra already in the repo for this (previously unused/half-wired):
   - `scripts/radiomics_utils/snr_binwidth.py` -- noise-based per-sequence bin width
     recommendation (IBSI/Boellaard-style: `binWidth = 2 x noise sigma`).
-  - `scripts/radiomics_utils/binwidth_texture_gallery.py` -- visual sanity check of
+  - `scripts/plots/binwidth_texture_gallery.py` -- visual sanity check of
     candidate bin widths on one patient.
-  - `scripts/radiomics_utils/stability.py`, `feature_stability.py`,
+  - `scripts/plots/stability.py`, `feature_stability.py`,
     `icc_stability_per_sequence_category.py` -- ICC-based stability comparison across
     extraction-setting variants (bin width, reader, interpolator, spacing).
-  - `scripts/radiomics_utils/extraction.py` / `main_orchestrator.py` -- already has the
+  - `scripts/radiomics_utils/extraction.py` (`run_batch_extraction`) -- the
     `itertools.product` sweep machinery over readers/interpolators/spacings/bin_widths;
-    currently collapsed to single values in the YAML.
+    the interpolator/spacing lists are currently collapsed to single values in the YAML.
 - Noise is estimated from small homogeneous **liver patches** (not tumor ROI, and not a
   whole-liver mask) -- patches were deliberately delineated away from vessels/other
   structures specifically for this calibration. Do NOT use tumor segmentations for the
@@ -57,12 +60,12 @@ specific, and whether N4 bias correction should be applied uniformly.
   ratio -- two sequences can both land at std=100 post-normalization with very different
   fractions of that variance coming from real noise. Per-sequence calibration is still
   necessary.
-- Still open: the drive holding the calibration set (`/Volumes/T7 Shield/Restrepo/
-  Calibration_Set`) hasn't been mounted yet during this work, so `snr_binwidth.py`
-  hasn't actually been run against real data. Once it has, validate the recommended
-  per-sequence bin widths against the current uniform `binWidth=5` using the
-  ICC-stability sweep (`stability.py`/`feature_stability.py`) before changing
-  `radiomics_params.yaml`.
+- Result: `snr_binwidth.py` has been run on liver patches (n=10, `Total_segmentations/
+  liver_segs`). Per the YAML, the widths are 2 x median noise sigma in normalized space,
+  rounded to the nearest 5: `pre/ap/pvp/tp` = 25, `hbp/dwi_b1/dwi_b2` = 40, `t2` = 15,
+  `adc` = 60 (`execution.per_sequence_bin_widths`).
+- Still open: validating these per-sequence widths against uniform widths (5, 20) with the
+  ICC-stability sweep (`stability.py`/`feature_stability.py`).
 
 ## N4 bias correction: should not be applied uniformly
 
@@ -80,13 +83,13 @@ specific, and whether N4 bias correction should be applied uniformly.
   but low SNR (especially high-b images), Rician noise statistics, and EPI geometric/
   susceptibility distortion (which N4 does not model) make bias-field estimation less
   reliable there than on anatomical sequences.
-- Decision on how to route around this in code: rather than adding sequence-type
-  branching logic to `n4_correction.py`, the plan is to keep that script's logic
-  unchanged and instead rename the raw ADC/DWI files to include the `_N4` suffix
-  (whether or not N4 was actually run on them), so downstream filename-matching logic
-  in `extraction.py`/`snr_binwidth.py` (which looks for `"n4"` in the filename) doesn't
-  need to change. This is a deliberate minimal-footprint choice -- revisit if it causes
-  confusion later (the filename would then lie about whether N4 was actually applied).
+- Decision as implemented: `n4_correction.py` was left unchanged and still produces an
+  `_N4` file for every sequence, so `{pid}_{seq}_N4.nrrd` exists for ADC/DWI too (checked on
+  one patient: it is a genuinely different, N4-corrected volume, not a renamed copy of
+  the raw file). The raw-file rename plan was not carried out. Instead, `extraction.py`
+  reads `execution.sequences_without_n4` (`['adc', 'dwi_b1', 'dwi_b2']`) from the YAML and
+  uses the plain `{pid}_{seq}.nrrd` for those, and `{pid}_{seq}_N4.nrrd` for the other six
+  sequences. The `_N4` ADC/DWI files are therefore unused by extraction.
 
 ## `feature_stability.py` bug fixes (applied)
 
@@ -117,8 +120,8 @@ specific, and whether N4 bias correction should be applied uniformly.
 
 - No `requirements.txt`/`environment.yml` exists in the repo yet. Project imports
   `pingouin`, `SimpleITK`, `pyradiomics`, `xgboost`, `shap`, `tabpfn`, `torch`, and
-  standard scientific-Python packages, none of which are installed in the system
-  Python on this machine (no venv/conda env found either) -- that's why VSCode/Pylance
-  shows unresolved-import warnings; it's an environment issue, not a code bug. A
-  `requirements.txt` generated from actual imports across `scripts/` would fix this but
-  hasn't been created yet.
+  standard scientific-Python packages. On this machine the extraction dependencies
+  (`pyradiomics`, `SimpleITK`, `PyYAML`, `pandas`) import under `/usr/bin/python3`, but not
+  under the default `python3` on PATH (`/usr/local/bin`), so run extraction with
+  `/usr/bin/python3` (as `repro_chain.sh` does). A `requirements.txt` generated from actual
+  imports across `scripts/` would remove the ambiguity but hasn't been created yet.

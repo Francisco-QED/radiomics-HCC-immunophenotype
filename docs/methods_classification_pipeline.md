@@ -1,6 +1,6 @@
 # Methods: HCC TILs Classification Pipeline
 
-Covers `scripts/radiomics_utils/main_pipeline.py` (stages: `partition` → `gridsearch` → `train`),
+Covers `scripts/tils_classification/main_pipeline.py` (stages: `partition` → `gridsearch` → `train`),
 orchestrated across sequence combinations by `sequence_sweep.py` / `gridsearch_train_sweep.py`.
 Methods only — results are reported separately once the current sweep completes.
 
