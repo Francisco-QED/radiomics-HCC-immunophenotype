@@ -11,6 +11,7 @@ import argparse
 import os
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yaml
 from sklearn.model_selection import train_test_split
@@ -52,8 +53,11 @@ def main():
     feats = []
     for c in cfg["data"]["features"]:
         n = c["cohort"]
-        stem = n.replace("_pre_new", "")  # SA2_pre_new files are named R-SA2_...
+        stem = {"SA2_pre": "SA2", "SA2_post": "SA2-post"}.get(n, n)  # folder name -> file stem
         feats += pd.read_csv(sheets / f"{n}/R-{stem}_I-sitkBSpline_S-1mm_W-{bw}.csv", index_col=0, usecols=[0]).index.tolist()
+    if cfg["data"].get("exclude_unscored", False):
+        o = pd.read_excel(db / cfg["data"]["outcomes_xlsx"]).set_index("PatientID")[cfg["data"]["label_col"]]
+        feats = [f for f in feats if pd.notna(o.get(f, np.nan))]
     split, n0 = make_split(db / cfg["data"]["outcomes_xlsx"], icc, cfg["data"]["label_col"],
                            cfg["preprocessing"]["split"]["test_size"], cfg["run"]["seeds"]["partition"],
                            feature_ids=feats)

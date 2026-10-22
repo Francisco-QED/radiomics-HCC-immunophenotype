@@ -24,21 +24,24 @@ data:
   binwidth: perseq                    # perseq | 5 | 20 -- picks the filename suffix for ALL sheets at once
   features:                           # merged at load time; the run aborts if IDs overlap or columns differ
     - {cohort: SA1,         note: untreated, imaging~resection}
-    - {cohort: SA2-post,    note: post-treatment MRI}
+    - {cohort: SA2_post,    note: post-treatment MRI}
   reader1_cohort: inter-reader/Reader1            # -> R-Reader1_I-sitkBSpline_S-1mm_W-{binwidth}.csv
   reader2_cohort: inter-reader/Reader2
-  mastersheet: mastersheet_2026-10-13.xlsx        # single source of truth (relative to paths.inputs.databases)
+  mastersheet: mastersheet_2026-10-16.xlsx        # single source of truth (relative to paths.inputs.databases)
   sa2_tab: SA2-post                               # SA2-pre | SA2-post -- feeds build_tables_from_mastersheet.py
   outcomes_xlsx: immunophenotype_outcomes_v2.xlsx # derived from the mastersheet, never hand-edited
   clinical_xlsx: SA1-2_clinical_imaging_v2.xlsx
   id_col: PatientID
   label_col: TILs_resection
   # Guard rails: the run aborts (not warns) if these do not hold, so a stale/mismatched sheet can't slip through.
-  expected_n_features_patients: 140
+  expected_n_features_patients: 141
+  exclude_unscored: true                          # drop (and log) patients with features but no TILs score yet (P200 as of 2026-10-16)
   require_outcome_and_clinical_rows: true         # every feature patient needs a TILs value + clinical row, else listed + abort
   cohort_changes:                                 # documentation, written to the run manifest
     removed_vs_2026-07: [P042, P050, P097, P118]  # had NaN TILs (rejected)
     added_vs_2026-07:   [P141, P147, P155, P197]  # TILs + demographics now in the mastersheet; no qualitative MRI fields yet
+    moved_cohort: {P141: SA2 -> SA1 (untreated), 2026-10-16}   # features/TILs identical; only the cohort label changed
+    added_unscored: [P200]                        # new SA2 patient, pre+post MRI, N4 done, TILs not yet scored
     newly_scored: [P025]                          # had NaN TILs before
     tils_changed: [P003, P014, P043, P065, P067, P112]   # SA1 re-reads, mastersheet is authoritative
 

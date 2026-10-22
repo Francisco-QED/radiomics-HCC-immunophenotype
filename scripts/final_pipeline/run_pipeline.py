@@ -51,7 +51,8 @@ def load_config(path):
 
 
 def sheet_path(cfg, cohort):
-    stem = cohort.split("/")[-1].replace("_pre_new", "")      # SA2_pre_new folder holds R-SA2_*.csv
+    folder = cohort.split("/")[-1]
+    stem = {"SA2_pre": "SA2", "SA2_post": "SA2-post"}.get(folder, folder)
     return cfg["_sheets"] / cohort / f"R-{stem}_I-sitkBSpline_S-1mm_W-{cfg['data']['binwidth']}.csv"
 
 
@@ -88,13 +89,19 @@ def build_cohort(cfg):
         problems.append(f"features vs clinical: only features={sorted(ids - set(clinical.PatientID))}, "
                         f"only clinical={sorted(set(clinical.PatientID) - ids)}")
     no_label = sorted(set(outcomes.loc[outcomes[cfg["data"]["label_col"]].isna(), "PatientID"]) & ids)
-    if no_label and cfg["data"].get("require_outcome_and_clinical_rows", True):
-        problems.append(f"patients with features but no {cfg['data']['label_col']}: {no_label}")
+    exclude_unscored = bool(cfg["data"].get("exclude_unscored", False))
+    if no_label and not exclude_unscored and cfg["data"].get("require_outcome_and_clinical_rows", True):
+        problems.append(f"patients with features but no {cfg['data']['label_col']}: {no_label} "
+                        f"(set data.exclude_unscored: true to drop and log them)")
     exp = cfg["data"].get("expected_n_features_patients")
     if exp is not None and len(ids) != exp:
         problems.append(f"expected {exp} patients with features, found {len(ids)}")
     if problems:
         raise SystemExit("COHORT GUARD RAILS FAILED:\n  - " + "\n  - ".join(problems))
+    if no_label and exclude_unscored:
+        print(f"EXCLUDING {len(no_label)} unscored patient(s) (no {cfg['data']['label_col']}): {no_label}")
+        merged = merged.drop(index=no_label)
+        merged.attrs["excluded_unscored"] = no_label
     return merged
 
 
