@@ -7,7 +7,7 @@ constraint, inner scoring AUC (3-fold). Only the OUTER split is repeated (repeat
 repeat 0 reproduces the single-split numbers in the ladder. Dev patients only; lock never read. Requires scikit-learn >= 1.8
 (the sparse code relies on l1_ratio acting without penalty='elasticnet').
 """
-import argparse, json, sys, time, warnings
+import argparse, json, os, sys, time, warnings
 from datetime import datetime
 from pathlib import Path
 sys.dont_write_bytecode = True
@@ -15,7 +15,7 @@ import numpy as np, pandas as pd, joblib, sklearn
 from sklearn.model_selection import StratifiedKFold
 
 GPT = None      # no default: --gpt-dir must point at this session's own snapshot copy, never at another agent's live folder
-ROOT = Path("/Users/Francisco/Library/CloudStorage/OneDrive-TheMountSinaiHospital/Regeneron retrospective radiomics")
+ROOT = Path(os.environ.get("RADIOMICS_PROJECT_ROOT", Path.home() / "Library/CloudStorage/OneDrive-TheMountSinaiHospital/Regeneron retrospective radiomics"))
 SETS = {"tp": ("tp",), "pvp+tp": ("pvp", "tp"), "dwi_b2+tp": ("dwi_b2", "tp"), "dwi_b2+pvp+tp": ("dwi_b2", "pvp", "tp")}
 
 
@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--ridge-clinical", choices=["append", "compete"], default="append", help="append: all clinical variables added to the ridge top-k radiomics clusters; compete: clinical variables join the cluster ranking (total <= k <= 20)")
     ap.add_argument("--all-patients", action="store_true", help="treat all 141 patients (dev + lock) as one development pool: repeated CV on everyone, no held-out set (the lock set is then not held out)")
     ap.add_argument("--gpt-dir", required=True, help="folder holding run_compact_ridge_sequence_search.py and run_sparse_dynamic_extensions.py (a byte-identical local copy is more robust than OneDrive)")
+    ap.add_argument("--exclude-shape", action="store_true", help="exclude original_shape features (for exterior-annulus negative-control analyses)")
     a = ap.parse_args(); warnings.filterwarnings("ignore")
     assert tuple(int(x) for x in sklearn.__version__.split(".")[:2]) >= (1, 8), "needs scikit-learn >= 1.8 (use /usr/local/bin/python3)"
     sys.path.insert(0, a.gpt_dir)
@@ -62,6 +63,8 @@ def main():
         y = (tls >= (2 if a.endpoint == "tls_ge2" else 1)).astype(int)
     X = pd.read_csv(sheet, index_col=0, usecols=lambda c: c == "PatientID" or "_original_" in c).loc[dev_ids]
     X = X.reindex(sorted(X.columns), axis=1).astype(float); assert X.shape == (len(dev_ids), 963), X.shape
+    if a.exclude_shape:
+        X = X[[c for c in X.columns if "_original_shape_" not in c]]
     clin_cols = []
     if a.clinical_matrix:
         import clinrad_patch as cp
@@ -72,7 +75,7 @@ def main():
     run.mkdir(parents=True, exist_ok=False)
     (run / "manifest.json").write_text(json.dumps(dict(started=datetime.now().isoformat(), sheet=str(sheet), endpoint={"tils_ge3": "TILs>=3 (0-2 vs 3)", "tls_ge2": "TLS>=2 (0-1 vs 2)", "tls_ge1": "TLS>=1 (0 vs 1-2)", "tils_ge2": "TILs>=2"}[a.endpoint], n_dev=len(dev_ids), lock_evaluated=False,
         sets=a.sets, families=a.families, repeats=a.repeats, clinical_cols=a.clinical_cols if a.clinical_matrix else [], sheets_dir=str(SH), reader_sheets=readers, all_patients=a.all_patients, ridge_clinical=a.ridge_clinical, sklearn=sklearn.__version__, gpt_sparse_script=sp.__file__, gpt_sha256={Path(m.__file__).name: __import__("hashlib").sha256(Path(m.__file__).read_bytes()).hexdigest() for m in (core, sp)}, outer="5-fold stratified seed 42+repeat",
-        inner="3-fold seed 420+fold+1000*repeat"), indent=2))
+        inner="3-fold seed 420+fold+1000*repeat", exclude_shape=a.exclude_shape), indent=2))
     print("RUN_DIRECTORY=" + str(run), flush=True)
     if clin_cols:
         cp.apply(core, sp, ridge_compete=(a.ridge_clinical == "compete"))

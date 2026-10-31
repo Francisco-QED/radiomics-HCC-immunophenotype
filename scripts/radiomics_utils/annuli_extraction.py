@@ -19,8 +19,8 @@ import SimpleITK as sitk
 from scipy import ndimage as ndi
 
 HERE = Path(__file__).resolve().parent
-SEG = Path("/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Total_segmentations")
-SUPPLIED = Path("/Volumes/LaCie2/peritumor_all_2026-10-26")      # annulus masks supplied by the project owner (SA1 / SA2 pre-treatment), used with --mask-source supplied
+SEG = Path(os.environ.get("RADIOMICS_SEG_ROOT", "/Volumes/T7 Shield/Restrepo/HCC_Retrospective_radiomics/Total_segmentations"))
+SUPPLIED = Path(os.environ.get("RADIOMICS_ANNULUS_MASK_ROOT", "/Volumes/LaCie2/peritumor_all_2026-10-26"))
 logging.getLogger("radiomics").setLevel(logging.ERROR)
 
 
@@ -53,9 +53,11 @@ def work(task):
     img_p, seg_p = paths(target, pid, seq, set(ex["sequences_without_n4"]))
     if not (img_p.exists() and seg_p.exists()): return pid, seq, None, "missing image or mask"
     try:
-        if source == "supplied":      # annulus mask given; Reader1 ROIs are identical to the SA1 ROIs, so SA1 masks serve Reader1
-            sub = "SA1" if (target == "Reader1" and not str(mask_root).rstrip("/").endswith("masks_slicer")) else target.replace("-", "_")
-            ring = sitk.ReadImage(str(Path(mask_root) / sub / pid / f"{pid}_{seq}_annulus.seg.nrrd")); n_tum, n_ring = 0, int((sitk.GetArrayFromImage(ring) > 0).sum())
+        if source == "supplied":      # prefer target-specific generated masks; retain the legacy Reader1->SA1 fallback only when needed
+            preferred = Path(mask_root) / target.replace("-", "_")
+            legacy = Path(mask_root) / "SA1"
+            base = preferred if preferred.is_dir() else legacy if target == "Reader1" and legacy.is_dir() else preferred
+            ring = sitk.ReadImage(str(base / pid / f"{pid}_{seq}_annulus.seg.nrrd")); n_tum, n_ring = 0, int((sitk.GetArrayFromImage(ring) > 0).sum())
             ring = sitk.Cast(ring > 0, sitk.sitkUInt8)
         else: ring, n_tum, n_ring = build_annulus(seg_p, out_mm, in_mm)
         if n_ring == 0: return pid, seq, None, "empty annulus (no label-1 tumor)"

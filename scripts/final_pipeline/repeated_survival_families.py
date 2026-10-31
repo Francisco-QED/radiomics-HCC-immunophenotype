@@ -9,7 +9,7 @@ Validation: repeated outer 5-fold CV stratified on event x cohort (repeat r: out
 metric = pooled out-of-fold Harrell C-index. Dev patients only; lock never read.
 Optional clinical variables (--clinical): none | forced (always included, not ranked) | compete (rank together with the radiomics clusters inside each fold).
 """
-import argparse, json, sys, time, warnings
+import argparse, json, os, sys, time, warnings
 from datetime import datetime
 from pathlib import Path
 sys.dont_write_bytecode = True
@@ -26,7 +26,7 @@ from sksurv.linear_model import CoxPHSurvivalAnalysis, CoxnetSurvivalAnalysis
 from sksurv.metrics import concordance_index_censored
 from sksurv.util import Surv
 
-ROOT = Path("/Users/Francisco/Library/CloudStorage/OneDrive-TheMountSinaiHospital/Regeneron retrospective radiomics")
+ROOT = Path(os.environ.get("RADIOMICS_PROJECT_ROOT", Path.home() / "Library/CloudStorage/OneDrive-TheMountSinaiHospital/Regeneron retrospective radiomics"))
 K_GRID = (10, 15, 20)
 RIDGE_ALPHAS = (0.1, 1.0, 10.0, 100.0, 1000.0)
 EN_RATIOS = (0.25, 0.5, 0.75)
@@ -147,6 +147,7 @@ def main():
     ap.add_argument("--split", default=str(ROOT / "Results/main_pipeline_claude/main_pipeline_recurrence/split/recurrence_split.csv"))
     ap.add_argument("--output-parent", required=True)
     ap.add_argument("--label", default="recurrence")
+    ap.add_argument("--exclude-shape", action="store_true", help="exclude original_shape features (for exterior-annulus negative-control analyses)")
     a = ap.parse_args(); warnings.filterwarnings("ignore")
     sys.path.insert(0, a.gpt_dir)
     import run_compact_ridge_sequence_search as core
@@ -156,6 +157,8 @@ def main():
     import sheets_root; sheet = sheets_root.combined_sheet(ROOT, a.sheet)
     X = pd.read_csv(sheet, index_col=0, usecols=lambda c: c == "PatientID" or "_original_" in c).loc[ids]
     X = X.reindex(sorted(X.columns), axis=1).astype(float)
+    if a.exclude_shape:
+        X = X[[c for c in X.columns if "_original_shape_" not in c]]
     readers = sheets_root.reader_sheets(ROOT)
     forced = ()
     if a.clinical != "none":
@@ -166,7 +169,7 @@ def main():
     run = Path(a.output_parent) / f"{a.label}_{a.sheet}_{a.clinical}_{'-'.join(s.replace('+', '_') for s in a.sets)}_{datetime.now():%Y%m%d_%H%M%S}"; run.mkdir(parents=True, exist_ok=False)
     (run / "manifest.json").write_text(json.dumps(dict(started=datetime.now().isoformat(), endpoint="time to recurrence (Harrell C, pooled OOF)", n_dev=len(ids), events=int(dev.event.sum()), lock_evaluated=False,
         sets=a.sets, families=a.families, clinical=a.clinical, clinical_cols=list(clin.columns) if a.clinical != "none" else [], repeats=a.repeats, sheet=str(sheet),
-        strata=strata_all.value_counts().to_dict(), icc="global (all dev double-reader patients)", sklearn=sklearn.__version__), indent=2))
+        strata=strata_all.value_counts().to_dict(), icc="global (all dev double-reader patients)", sklearn=sklearn.__version__, exclude_shape=a.exclude_shape), indent=2))
     print("RUN_DIRECTORY=" + str(run), "| dev", len(ids), "events", int(dev.event.sum()), "| clinical:", a.clinical, flush=True)
     RealICC = core.TechnicalICCFilter; rows = []; oof_rows = []
     for sname in a.sets:
