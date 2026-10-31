@@ -68,6 +68,7 @@ def main():
     ap.add_argument("--oof-glob", default="tilsGE2_post_*/oof_predictions.csv", help="glob (relative to --ladder-dir) of the ladder OOF files")
     ap.add_argument("--clinical-matrix", default=None); ap.add_argument("--clinical-cols", nargs="*", default=None)
     ap.add_argument("--sheet", choices=["pre", "post"], default="post")
+    ap.add_argument("--ridge-clinical", choices=["append", "compete"], default="append")
     ap.add_argument("--tag", default="radiomics", help="category label used in output file names")
     ap.add_argument("--families", nargs="+", default=["ridge", "lasso", "elastic_net"])
     a = ap.parse_args(); warnings.filterwarnings("ignore")
@@ -75,7 +76,8 @@ def main():
     import run_compact_ridge_sequence_search as core
     import run_sparse_dynamic_extensions as sp
     X, y, dev_ids, lock_ids, split_path, feature_path, readers = core.load_development(ROOT); lock_ids = sorted(lock_ids)
-    sheet = ROOT / ("Results/Radiomics_sheets/SA1_2_post/R-SA1_2-post_I-sitkBSpline_S-1mm_W-perseq.csv" if a.sheet == "post" else "Results/Radiomics_sheets/SA1_2_pre/R-SA1_2_I-sitkBSpline_S-1mm_W-perseq.csv")
+    import sheets_root; readers = sheets_root.reader_sheets(ROOT)
+    sheet = sheets_root.combined_sheet(ROOT, a.sheet)
     X = pd.read_csv(sheet, index_col=0, usecols=lambda c: c == "PatientID" or "_original_" in c).loc[dev_ids]; X = X.reindex(sorted(X.columns), axis=1).astype(float)      # dev features from the chosen sheet
     XL = pd.read_csv(sheet, index_col=0, usecols=lambda c: c == "PatientID" or "_original_" in c).loc[lock_ids]; XL = XL.reindex(sorted(XL.columns), axis=1).astype(float)
     assert list(XL.columns) == list(X.columns)
@@ -84,7 +86,7 @@ def main():
         import clinrad_patch as cp
         cm = pd.read_csv(a.clinical_matrix, index_col=0); cm = cm[a.clinical_cols] if a.clinical_cols else cm
         X = pd.concat([X, cm.loc[dev_ids].add_prefix(cp.CLIN).astype(float)], axis=1); XL = pd.concat([XL, cm.loc[lock_ids].add_prefix(cp.CLIN).astype(float)], axis=1)
-        clin_cols = [c for c in X.columns if c.startswith(cp.CLIN)]; cp.apply(core, sp); core.TechnicalICCFilter = cp.icc_keep_clin(core.TechnicalICCFilter)
+        clin_cols = [c for c in X.columns if c.startswith(cp.CLIN)]; cp.apply(core, sp, ridge_compete=(a.ridge_clinical == "compete")); core.TechnicalICCFilter = cp.icc_keep_clin(core.TechnicalICCFilter)
     lab = pd.read_csv(split_path, usecols=["PatientID", "set", "TILs_resection"]).set_index("PatientID"); assert (lab.loc[lock_ids, "set"] == "lock").all()
     yL = (lab.loc[lock_ids, "TILs_resection"] >= 2).astype(int)
     if a.endpoint == "tils_ge3":     # TILs >= 3 vs 0-2

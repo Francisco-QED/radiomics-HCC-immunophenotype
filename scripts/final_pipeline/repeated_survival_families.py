@@ -153,10 +153,10 @@ def main():
     Sel = make_selector(core)
     sp = pd.read_csv(a.split); dev = sp[sp["set"] == "dev"].reset_index(drop=True); ids = dev.PatientID.tolist()
     ytr_all = Surv.from_arrays(event=dev.event.astype(bool).values, time=dev.time_days.astype(float).values, name_event="event", name_time="time")
-    sheet = ROOT / ("Results/Radiomics_sheets/SA1_2_pre/R-SA1_2_I-sitkBSpline_S-1mm_W-perseq.csv" if a.sheet == "pre" else "Results/Radiomics_sheets/SA1_2_post/R-SA1_2-post_I-sitkBSpline_S-1mm_W-perseq.csv")
+    import sheets_root; sheet = sheets_root.combined_sheet(ROOT, a.sheet)
     X = pd.read_csv(sheet, index_col=0, usecols=lambda c: c == "PatientID" or "_original_" in c).loc[ids]
     X = X.reindex(sorted(X.columns), axis=1).astype(float)
-    readers = [str(ROOT / f"Results/Radiomics_sheets/inter-reader/Reader{i}/R-Reader{i}_I-sitkBSpline_S-1mm_W-perseq.csv") for i in (1, 2)]
+    readers = sheets_root.reader_sheets(ROOT)
     forced = ()
     if a.clinical != "none":
         cm = pd.read_csv(a.clinical_matrix, index_col=0).loc[ids]

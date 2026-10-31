@@ -38,6 +38,8 @@ def main():
                          "(ICC uses reader measurements only, never the outcome, so this is not outcome leakage)")
     ap.add_argument("--clinical-matrix", default=None, help="CSV (PatientID index, numeric) of clinico-radiologic variables to add to every radiomics model (prefix clin_)")
     ap.add_argument("--clinical-cols", nargs="*", default=None)
+    ap.add_argument("--ridge-clinical", choices=["append", "compete"], default="append", help="append: all clinical variables added to the ridge top-k radiomics clusters; compete: clinical variables join the cluster ranking (total <= k <= 20)")
+    ap.add_argument("--all-patients", action="store_true", help="treat all 141 patients (dev + lock) as one development pool: repeated CV on everyone, no held-out set (the lock set is then not held out)")
     ap.add_argument("--gpt-dir", required=True, help="folder holding run_compact_ridge_sequence_search.py and run_sparse_dynamic_extensions.py (a byte-identical local copy is more robust than OneDrive)")
     a = ap.parse_args(); warnings.filterwarnings("ignore")
     assert tuple(int(x) for x in sklearn.__version__.split(".")[:2]) >= (1, 8), "needs scikit-learn >= 1.8 (use /usr/local/bin/python3)"
@@ -45,8 +47,11 @@ def main():
     import run_compact_ridge_sequence_search as core
     import run_sparse_dynamic_extensions as sp
     X0, y, dev_ids, lock_ids, split_path, feature_path, readers = core.load_development(ROOT)
-    sheet = ROOT / ("Results/Radiomics_sheets/SA1_2_post/R-SA1_2-post_I-sitkBSpline_S-1mm_W-perseq.csv" if a.sheet == "post"
-                    else "Results/Radiomics_sheets/SA1_2_pre/R-SA1_2_I-sitkBSpline_S-1mm_W-perseq.csv")
+    import sheets_root; readers = sheets_root.reader_sheets(ROOT)
+    if a.all_patients:
+        dev_ids = list(dev_ids) + sorted(lock_ids); lab = pd.read_csv(split_path, usecols=["PatientID", "TILs_resection"]).set_index("PatientID").loc[dev_ids, "TILs_resection"]; y = (lab >= 2).astype(int)
+    import sheets_root; SH = sheets_root.sheets_dir(ROOT)
+    sheet = sheets_root.combined_sheet(ROOT, a.sheet)
     if a.endpoint == "tils_ge3":
         tils = pd.read_excel(a.outcomes).set_index("PatientID")["TILs_resection"].reindex(dev_ids)
         assert tils.notna().all(), f"missing TILs for dev patients: {tils[tils.isna()].index.tolist()}"
@@ -66,11 +71,11 @@ def main():
     run = Path(a.output_parent) / f"{a.label}_{a.sheet}_{'-'.join(s.replace('+','_') for s in a.sets)}_{datetime.now():%Y%m%d_%H%M%S}"
     run.mkdir(parents=True, exist_ok=False)
     (run / "manifest.json").write_text(json.dumps(dict(started=datetime.now().isoformat(), sheet=str(sheet), endpoint={"tils_ge3": "TILs>=3 (0-2 vs 3)", "tls_ge2": "TLS>=2 (0-1 vs 2)", "tls_ge1": "TLS>=1 (0 vs 1-2)", "tils_ge2": "TILs>=2"}[a.endpoint], n_dev=len(dev_ids), lock_evaluated=False,
-        sets=a.sets, families=a.families, repeats=a.repeats, clinical_cols=a.clinical_cols if a.clinical_matrix else [], sklearn=sklearn.__version__, gpt_sparse_script=sp.__file__, gpt_sha256={Path(m.__file__).name: __import__("hashlib").sha256(Path(m.__file__).read_bytes()).hexdigest() for m in (core, sp)}, outer="5-fold stratified seed 42+repeat",
+        sets=a.sets, families=a.families, repeats=a.repeats, clinical_cols=a.clinical_cols if a.clinical_matrix else [], sheets_dir=str(SH), reader_sheets=readers, all_patients=a.all_patients, ridge_clinical=a.ridge_clinical, sklearn=sklearn.__version__, gpt_sparse_script=sp.__file__, gpt_sha256={Path(m.__file__).name: __import__("hashlib").sha256(Path(m.__file__).read_bytes()).hexdigest() for m in (core, sp)}, outer="5-fold stratified seed 42+repeat",
         inner="3-fold seed 420+fold+1000*repeat"), indent=2))
     print("RUN_DIRECTORY=" + str(run), flush=True)
     if clin_cols:
-        cp.apply(core, sp)
+        cp.apply(core, sp, ridge_compete=(a.ridge_clinical == "compete"))
     RealICC = core.TechnicalICCFilter      # keep the ORIGINAL class: the global-ICC patch below must never feed back into the next set
     memory = joblib.Memory(Path("/private/tmp") / run.name, verbose=0); rows = []; oof_rows = []
     import atexit, shutil; atexit.register(shutil.rmtree, str(Path("/private/tmp") / run.name), True)      # the joblib cache is only needed during the run; never leave it behind (it filled the disk once)

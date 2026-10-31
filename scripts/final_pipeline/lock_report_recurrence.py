@@ -79,6 +79,7 @@ def main():
     ap.add_argument("--tag", required=True, choices=["radiomics", "radiomics_clinical", "clinical"])
     ap.add_argument("--oof-glob", required=True, help="glob of oof_risk.csv files")
     ap.add_argument("--clinical-cols", nargs="*", default=None)
+    ap.add_argument("--clinical-mode", choices=["forced", "compete"], default="forced", help="must match the --clinical mode of the ladder run")
     ap.add_argument("--clinical-matrix", default=str(ROOT / "Results/main_pipeline_claude/main_pipeline_recurrence/clinical/clinical_matrix.csv"))
     ap.add_argument("--out", default=str(ROOT / "Results/main_pipeline_claude/presentation_20261020/recurrence"))
     ap.add_argument("--sets", nargs="*", default=None)
@@ -101,9 +102,9 @@ def main():
     strata_d = dev.event.astype(int).astype(str) + "_" + dev.cohort
     M = pd.read_csv(a.clinical_matrix, index_col=0)
     clin = M[a.clinical_cols].add_prefix("clin_") if a.clinical_cols else None
-    sheet = ROOT / ("Results/Radiomics_sheets/SA1_2_post/R-SA1_2-post_I-sitkBSpline_S-1mm_W-perseq.csv" if a.sheet == "post" else "Results/Radiomics_sheets/SA1_2_pre/R-SA1_2_I-sitkBSpline_S-1mm_W-perseq.csv")
+    import sheets_root; sheet = sheets_root.combined_sheet(ROOT, a.sheet)
     Xall = pd.read_csv(sheet, index_col=0, usecols=lambda c: c == "PatientID" or "_original_" in c); Xall = Xall.reindex(sorted(Xall.columns), axis=1).astype(float)
-    readers = [str(ROOT / f"Results/Radiomics_sheets/inter-reader/Reader{i}/R-Reader{i}_I-sitkBSpline_S-1mm_W-perseq.csv") for i in (1, 2)]
+    readers = sheets_root.reader_sheets(ROOT)
     RealICC = core.TechnicalICCFilter; rows = []
     combos = a.sets or sorted(oof.sequence_set.unique()) if "sequence_set" in oof else ["clinical"]
     fams = a.families or sorted(oof.family.unique())
@@ -115,7 +116,7 @@ def main():
             fixed = list(RealICC(*readers).fit(Xall.loc[dev_ids, cols]).columns_)
             Xs_dev, Xs_lock = Xall.loc[dev_ids, fixed], Xall.loc[lock_ids, fixed]; forced = ()
             if clin is not None:
-                Xs_dev, Xs_lock = pd.concat([Xs_dev, clin.loc[dev_ids]], axis=1), pd.concat([Xs_lock, clin.loc[lock_ids]], axis=1); forced = tuple(clin.columns)
+                Xs_dev, Xs_lock = pd.concat([Xs_dev, clin.loc[dev_ids]], axis=1), pd.concat([Xs_lock, clin.loc[lock_ids]], axis=1); forced = tuple(clin.columns) if a.clinical_mode == "forced" else ()
         for fam in fams:
             t0 = time.time(); o = oof[(oof.family == fam) & oof.risk.notna()]
             if "sequence_set" in o: o = o[o.sequence_set == sname]

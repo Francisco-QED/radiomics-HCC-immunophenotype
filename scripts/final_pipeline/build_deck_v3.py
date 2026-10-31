@@ -1,6 +1,6 @@
 """Results deck v3: same analysis as v2 with (i) tumor grade (mastersheet column BM) added to the clinico-radiologic variables,
 (ii) 'best model' = mean of OOF performance and lock performance (AUC; C-index for recurrence), (iii) mean-|SHAP| feature tables + complete feature lists,
-(iv) a model-selection slide and (v) a with/without-grade sensitivity slide. Starts from the 08-17-26 deck (theme + title slide kept); never overwrites it.
+and (iv) a model-selection slide. Starts from the 08-17-26 deck (theme + title slide kept); never overwrites it.
 
 Selection score = (OOF AUC + lock AUC) / 2, where OOF AUC is the AUC of the split-averaged out-of-fold predictions (the value shown in the tables); for recurrence the C-index analogue.
 The score is used (a) to pick the family for each sequence combination, (b) to rank combinations, (c) to pick the best model of each category.
@@ -113,7 +113,7 @@ def roc_fig(cfg, best, path):
         avg = o.groupby("PatientID").agg(y=("y", "first"), prob=("prob", "mean")); fpr, tpr, _ = roc_curve(avg.y, avg.prob)
         h, = ax[0].plot(fpr, tpr, color=col, lw=2, label=f"{name} ({r.sequence_set.replace('+', ' + ') if tag != 'clinical' else 'all variables'}, {FAM[r.family].lower()})"); handles.append(h)
         lp = pd.read_csv(cfg["dirs"][tag] / "models" / tag / model_folder(tag, r) / "lock_predictions.csv"); fpr, tpr, _ = roc_curve(lp.y_lock, lp.prob); ax[1].plot(fpr, tpr, color=col, lw=2)
-    for k, t in enumerate(("Development set: out-of-fold (averaged over splits)", "Lock set (one-shot; also used for model selection)")):
+    for k, t in enumerate(("Development set: out-of-fold (averaged over splits)", "Test set (one-shot)")):
         ax[k].plot([0, 1], [0, 1], "--", color="gray", lw=1); ax[k].set_xlabel("1 - specificity"); ax[k].set_ylabel("Sensitivity"); ax[k].set_title(t, fontsize=11); ax[k].set_aspect("equal"); ax[k].spines[["top", "right"]].set_visible(False)
     fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, fontsize=9.5); plt.tight_layout(rect=(0, 0.07, 1, 1)); plt.savefig(path, dpi=200, bbox_inches="tight"); plt.close()
 
@@ -154,7 +154,7 @@ def classification_section(prs, key, D, split, spec_extra, fallback, lists, summ
     v2.split_slide(prs, f"{cfg['label']} - development/testing data split", v2.split_table(D, split, spec, dev_n, lock_n))
     rb, cb = per_combo(tabs["radiomics"]), per_combo(tabs["radiomics_clinical"]); clb = tabs["clinical"].sort_values("score", ascending=False).reset_index(drop=True)
     perf_slide(prs, f"{cfg['label']} - radiomics models, top 10 of 14 sequence combinations", cls_rows(rb, 10), "cls")
-    perf_slide(prs, f"{cfg['label']} - radiomics + clinico-radiologic variables (incl. tumor grade), all 14 combinations", cls_rows(cb), "cls")
+    perf_slide(prs, f"{cfg['label']} - radiomics + clinico-radiologic variables, all 14 combinations", cls_rows(cb), "cls")
     best = {"radiomics": rb.iloc[0], "radiomics_clinical": cb.iloc[0], "clinical": clb.iloc[0]}
     s = bd.new_slide(prs, f"{cfg['label']} - best model of each category")
     t = cls_rows(pd.DataFrame([best[t] for t, _, _ in CAT])); t.insert(0, "Category", [n for _, n, _ in CAT])
@@ -177,7 +177,7 @@ def recurrence_section(prs, D, split, fallback, lists, summary):
     v2.split_slide(prs, "Recurrence - development/testing data split", v2.split_table(D, split, spec, dev_n, lock_n), note="Follow-up time = time to recurrence or last follow-up. One patient without follow-up excluded.")
     rb, cb = per_combo(tabs["radiomics"]), per_combo(tabs["radiomics_clinical"]); clb = tabs["clinical"].sort_values("score", ascending=False).reset_index(drop=True)
     perf_slide(prs, "Recurrence - radiomics models, top 10 of 14 sequence combinations", rec_rows(rb, 10), "rec", "The lock set was opened earlier in this project.")
-    perf_slide(prs, "Recurrence - radiomics + clinico-radiologic variables (incl. tumor grade), all 14 combinations", rec_rows(cb), "rec", "The lock set was opened earlier in this project.")
+    perf_slide(prs, "Recurrence - radiomics + clinico-radiologic variables, all 14 combinations", rec_rows(cb), "rec", "The lock set was opened earlier in this project.")
     best = {"radiomics": rb.iloc[0], "radiomics_clinical": cb.iloc[0], "clinical": clb.iloc[0]}
     R = BASE / "main_pipeline_recurrence"; km_dir = NEW / "recurrence" / "km"
     spec_json = {"best": [dict(tag=t, sequences=best[t].sequence_set, family=best[t].family) for t, _, _ in CAT], "model_dirs": {k: str(v) for k, v in cfg["dirs"].items()},
@@ -197,22 +197,6 @@ def recurrence_section(prs, D, split, fallback, lists, summary):
         bd.footnote(s, "Best per category = highest mean of OOF and lock C-index. High / low risk = above / at-or-below the median risk of the set shown. Time-dependent AUC(t): censoring-weighted. Lock set was opened earlier and enters selection: exploratory.", top=7.1)
     shap_slide(prs, "Recurrence - mean absolute SHAP", best, cfg["dirs"], lists); summary["rec"] = ("Recurrence", best, tabs)
     return best
-
-
-def grade_slide(prs, summary):
-    rows = []
-    for key, (label, best, tabs) in summary.items():
-        for tag, name in (("clinical", "Clinico-radiologic"), ("radiomics_clinical", "Radiomics + clinico-radiologic")):
-            kind = "rec" if key == "rec" else "cls"; old_dir = OLD / ("recurrence" if key == "rec" else key)
-            f = old_dir / (f"recurrence_model_table_{tag}.csv" if key == "rec" else f"{key}_model_table_{tag}.csv")
-            if not f.exists(): continue
-            o = add_score(pd.read_csv(f), kind); o = o.loc[o.score.idxmax()]; n = best[tag]
-            g = lambda r: (f"{r.oof_c_avg:.2f}", f"{r.lock_c:.2f}") if kind == "rec" else (f"{r.oof_auc_avgprob:.2f}", f"{r.lock_auc:.2f}")
-            sq = lambda r: r.sequence_set.replace("+", " + ") if r.sequence_set not in ("clinical", "clinicoradiologic") else "all"
-            rows.append({"Endpoint": label, "Category": name, "No grade: model": f"{sq(o)} / {FAM[o.family].lower()}", "OOF": g(o)[0], "Lock": g(o)[1], "With grade: model": f"{sq(n)} / {FAM[n.family].lower()}", "OOF ": g(n)[0], "Lock ": g(n)[1]})
-    s = bd.new_slide(prs, "Tumor grade sensitivity analysis")
-    bd.add_table(s, pd.DataFrame(rows), 0.4, 1.1, [1.8, 2.3, 2.0, 0.7, 0.7, 2.0, 0.7, 0.7], font=9, row_h=0.42, align_center_from=3, header_h=0.5)
-    bd.footnote(s, "Best model per category (highest mean of OOF and lock AUC / C-index) without vs with tumor grade (mastersheet column BM, ordinal G1-G4; 'G2/G3' = 2.5; imputed / scaled within folds). OOF / Lock = AUC (C-index for recurrence). Lock set enters selection: exploratory.", top=6.6)
 
 
 def selection_slide(prs):
@@ -236,34 +220,37 @@ def conclusions(prs, summary):
     bd.text_box(s, 0.5, 1.0, 12.3, 5.0, ["Extend the cohort (extended analysis, N=220) for external-style validation of frozen models selected without the lock set.", "Target IHC-derived endpoints.", "Target assessment of response to ICIs in SA2."], size=14, bullet=True)
 
 
-def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("--allow-fallback", action="store_true", help="TEST ONLY: use the no-grade results when the grade results do not exist yet"); a = ap.parse_args()
-    prs = Presentation(bd.TEMPLATE); ids = prs.slides._sldIdLst
-    for sid in list(ids)[1:]: prs.part.drop_rel(sid.rId); ids.remove(sid)
-    bd.text_box(prs.slides[0], 0.26, 5.6, 10, 0.5, [f"Results update, {date.today():%m/%d/%y}"], size=16)
-    D, r = bt.build_frame(); tils = pd.read_csv(BASE / "main_pipeline/final/cohort_v3_141/split/split.csv").set_index("PatientID"); rec = pd.read_csv(BASE / "main_pipeline_recurrence/split/recurrence_split.csv").set_index("PatientID")
+def front_matter(prs):
     s = bd.new_slide(prs, "Patients")
     pt = pd.DataFrame([{"Specific aim": "SA1", "Cohort size": "N = 111", "Description": "Retrospective cohort of resected, untreated HCC patients"}, {"Specific aim": "SA2", "Cohort size": "N = 30", "Description": "HCC patients who received neoadjuvant immunotherapy (IO, n=16; IO + SBRT, n=14) prior to resection"}])
     bd.add_table(s, pt, 0.5, 1.0, [2.0, 2.0, 7.6], font=12, row_h=0.5, align_center_from=1)
     bd.text_box(s, 0.5, 2.5, 11.5, 3.5, [("Inclusion criteria",), "Adult patients with chronic liver disease of any etiology and resected HCC (from last 14 years)", "Contrast-enhanced MRI (using gadoxetate) within 3 months of resection", "HCC lesions ≥ 2 cm", "Treatment with neoadjuvant IO (SA2 only)",
                                          ("Exclusion criteria",), "Poor MR image quality; previous locoregional or systemic therapy; unavailable tissue; previous liver transplant"], size=13, bullet=True)
     s = bd.new_slide(prs, "Data split and training")
-    bd.text_box(s, 0.5, 1.1, 12.3, 5.6, [("Split",), "TILs / TLS: 111 / 30 patients in development / lock sets (same split for both). Recurrence: 110 / 30; one patient without follow-up excluded.", "Lock-set use: see the Model selection slide (the lock set enters the selection score).",
+    bd.text_box(s, 0.5, 1.1, 12.3, 5.6, [("Split",), "TILs / TLS: 111 / 30 patients in development / test sets (same split for both). Recurrence: 110 / 30; one patient without follow-up excluded.",
                                          ("Validation (development set)",), "10 x repeated stratified 5-fold cross-validation (inner 3-fold for tuning); every preprocessing, selection and tuning step is refit inside each training fold.", "Performance = AUC (classification) or Harrell C-index (recurrence) of pooled out-of-fold predictions, with 95% CIs.",
-                                         ("Endpoints",), "TILs 2-3 vs 0-1;  TILs 3 vs 0-2;  TLS 2 vs 0-1;  recurrence (time to recurrence; 2-year recurrence for ROC curves)."], size=14, bullet=True)
+                                         ("Endpoints",), "TILs 2-3 vs 0-1;  TILs 3 vs 0-2;  TLS 2 vs 0-1;  recurrence (time to recurrence; Harrell C-index, Kaplan-Meier risk groups and time-dependent AUC)."], size=14, bullet=True)
     s = bd.new_slide(prs, "Radiomics model development")
     bd.text_box(s, 0.5, 1.0, 7.9, 5.9, [("Per training fold",), "963 original PyRadiomics features (9 sequences x 107), per-sequence bin widths, N4-corrected images; SA2 imaging is post-treatment.", "Inter-reader filter: ICC(3,1) ≥ 0.85 on 23 patients segmented by two readers (estimated once on development data).",
-                                         "QC: ≥ 80% observed, CV > 0.10; median imputation.", "Within-sequence complete-linkage clustering, |Spearman ρ| ≥ 0.85; one outcome-ranked representative per cluster.", "Ridge (top 10 / 15 / 20 clusters), lasso and elastic net (10-20 non-zero coefficients) logistic / Cox models; regularization tuned by inner 3-fold CV.",
-                                         ("Clinico-radiologic variables",), "Age, sex, BMI, etiology, cirrhosis, log AFP, tumor size, qualitative MRI (capsule, margin, mosaic, internal arteries, fat, T2, HBP, LI-RADS), treatment (untreated / IO / IO + SBRT) and tumor grade (pathology, ordinal G1-G4; mastersheet column BM). Binary variables with minority < 10% dropped.",
-                                         "Combined models: clinical variables added to the selected radiomics features (ridge) or to the candidate pool (lasso / elastic net)."], size=11.5, bullet=True)
+                                         "QC: ≥ 80% observed, CV > 0.10; median imputation.", "Within-sequence complete-linkage clustering, |Spearman ρ| ≥ 0.85; one outcome-ranked representative per cluster.", "Ridge, lasso and elastic net logistic / Cox models were considered; the final number of selected features was capped at 20. Regularization tuned by inner 3-fold CV.",
+                                         ("Clinico-radiologic variables",), "Age, sex, BMI, etiology, cirrhosis, log AFP, tumor size, qualitative MRI (capsule, margin, mosaic, internal arteries, fat, T2, HBP, LI-RADS), treatment (untreated / IO / IO + SBRT) and tumor grade (ordinal G1-G4). Binary variables with minority < 10% dropped.",
+                                         "Radiomics and clinico-radiologic features were combined; three scenarios were considered: radiomics only, clinico-radiologic variables only, and radiomics + clinico-radiologic variables."], size=11.5, bullet=True)
     combos = pd.DataFrame({"Sequence combinations (14)": ["TP", "PVP", "DWI (b2)", "HBP", "TP + PVP", "TP + DWI", "TP + HBP", "PVP + DWI", "PVP + HBP", "DWI + HBP", "TP + PVP + DWI", "TP + PVP + HBP", "TP + DWI + HBP", "PVP + DWI + HBP"]})
     bd.add_table(s, combos, 9.0, 1.1, [3.5], font=10, row_h=0.33, align_center_from=9)
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--allow-fallback", action="store_true", help="TEST ONLY: use the no-grade results when the grade results do not exist yet"); a = ap.parse_args()
+    prs = Presentation(bd.TEMPLATE); ids = prs.slides._sldIdLst
+    for sid in list(ids)[1:]: prs.part.drop_rel(sid.rId); ids.remove(sid)
+    bd.text_box(prs.slides[0], 0.26, 5.6, 10, 0.5, [f"Results update, {date.today():%m/%d/%y}"], size=16)
+    D, r = bt.build_frame(); tils = pd.read_csv(BASE / "main_pipeline/final/cohort_v3_141/split/split.csv").set_index("PatientID"); rec = pd.read_csv(BASE / "main_pipeline_recurrence/split/recurrence_split.csv").set_index("PatientID")
+    front_matter(prs)
     v2.cohort_slide(prs, D); selection_slide(prs)
     lists, summary = [], {}
     ex = [("TILs_resection", "TILs score", "cat"), ("TLS_resection", "TLS score", "cat")]
     classification_section(prs, "tils_ge2", D, tils, ex, a.allow_fallback, lists, summary); classification_section(prs, "tils_ge3", D, tils, ex, a.allow_fallback, lists, summary)
     classification_section(prs, "tls_ge2", D, tils, ex[::-1], a.allow_fallback, lists, summary); recurrence_section(prs, D, rec, a.allow_fallback, lists, summary)
-    grade_slide(prs, summary)
     seen = {}
     for ep, cat, label, sh in lists: seen.setdefault(ep, []).append((ep, cat, label, sh))
     for ep, items in seen.items(): feature_list_slide(prs, ep, items)
