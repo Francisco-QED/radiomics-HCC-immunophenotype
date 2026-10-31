@@ -27,7 +27,24 @@ Each mask run produces `geometry_audit.csv` and `geometry_audit_summary.json`. V
 
 The standard v4 screen retains shape features for direct comparison with earlier annulus analyses. A second v4 screen excludes all `original_shape` features because the exterior ring contour inherits tumor size and shape even when its voxel overlap with the tumor is exactly zero.
 
-## Prerequisites
+## Recommended two-machine workflow
+
+The masks and radiomics extraction require the T7 and LaCie2 source data. Run those two stages on the iMac, where the volumes are already mounted:
+
+```bash
+bash scripts/radiomics_utils/run_annuli_v3_v4_macbook.sh masks both
+bash scripts/radiomics_utils/run_annuli_v3_v4_macbook.sh extract both
+```
+
+The extraction stage writes the new `Annuli_v3` and `Annuli_v4` CSV folders to OneDrive. After those folders finish syncing, run only the model stage on the MacBook:
+
+```bash
+bash scripts/radiomics_utils/run_annuli_v3_v4_macbook.sh models both
+```
+
+The model stage needs no access to T7, LaCie2, or the masks. It reads the synchronized CSV sheets, project split/database files, and local GitHub checkout, and writes new timestamped result folders to OneDrive.
+
+## Prerequisites for running mask generation or extraction
 
 Connect the T7 Shield and LaCie2 volumes. Ensure these paths exist, or override them with environment variables:
 
@@ -48,9 +65,9 @@ export SURVIVAL_PY="/absolute/path/to/python-with-scikit-survival"
 
 `EXTRACT_PY` needs pandas, PyYAML, SimpleITK, SciPy, and PyRadiomics. `TIL_PY` needs scikit-learn >=1.8 plus the standard scientific Python packages. `SURVIVAL_PY` additionally needs scikit-survival.
 
-## Run
+## Running every stage on one machine
 
-From the repository root on branch `v2-stability-pipeline`:
+This option requires T7 and LaCie2 to be mounted on that same machine. From the repository root on branch `v2-stability-pipeline`:
 
 ```bash
 caffeinate -i bash scripts/radiomics_utils/run_annuli_v3_v4_macbook.sh all both \
